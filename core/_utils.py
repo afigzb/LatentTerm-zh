@@ -13,7 +13,17 @@ _RIGHT_NOISE = frozenset(
     '以为而及去里边处些个时后吗呢啊吧呀'
     '在和'
 )
-_PHRASE_MARKERS = frozenset('的和与或是')
+_PHRASE_MARKERS = frozenset('的和与或是把被让将给')
+
+# 这些字出现在 5+ 字串的内部时，几乎一定是短语而非词。
+# 短词（2-4字）不受此限制（"不死""到来""着急"等合法）。
+_LONG_PHRASE_INTERIOR = frozenset(
+    '着了过'          # 动态助词
+    '到在从向往'      # 介词
+    '把被让将给'      # 处置/被动标记
+    '我你他她它们'    # 代词
+    '个些位只'        # 量词
+)
 
 _RE_CHINESE = re.compile(r'[\u4e00-\u9fff]+')
 _RE_PURE_CHINESE = re.compile(r'^[\u4e00-\u9fff]+$')

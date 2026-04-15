@@ -18,7 +18,7 @@ import math
 from collections import Counter, defaultdict
 from typing import DefaultDict
 
-from ._utils import _RE_CHINESE, _entropy, _clean_boundary
+from ._utils import _RE_CHINESE, _entropy, _clean_boundary, _LONG_PHRASE_INTERIOR
 
 
 class VocabBuilderMixin:
@@ -46,15 +46,11 @@ class VocabBuilderMixin:
                 for length in range(self.min_len,
                                     min(self.max_len + 1, n - i + 1)):
                     w = seq[i:i + length]
-                    prev = freq[w]
-                    freq[w] = prev + 1
-                    # 仅对第二次及以后出现的 n-gram 统计邻字，
-                    # 跳过 singleton 以减少 Counter 写入量
-                    if prev >= 1:
-                        if i > 0:
-                            left_nb[w][seq[i - 1]] += 1
-                        if i + length < n:
-                            right_nb[w][seq[i + length]] += 1
+                    freq[w] += 1
+                    if i > 0:
+                        left_nb[w][seq[i - 1]] += 1
+                    if i + length < n:
+                        right_nb[w][seq[i + length]] += 1
 
         self._freq = freq
         self._left_nb = left_nb
@@ -70,8 +66,13 @@ class VocabBuilderMixin:
         for w, f in freq.items():
             if f < 2 or len(w) < self.min_len:
                 continue
+            wlen = len(w)
+            if wlen >= 6 and any(c in _LONG_PHRASE_INTERIOR for c in w[1:-1]):
+                continue
+            # 长词切分点多，更容易被高频子串拉低凝固度，按长度放宽门槛
+            len_discount = 2.0 / max(wlen, 2)
             coh = self._cohesion(w)
-            if coh < coh_relaxed:
+            if coh < coh_relaxed * len_discount:
                 continue
             freedom = min(_entropy(left_nb[w]), _entropy(right_nb[w]))
             entry = {
@@ -81,7 +82,16 @@ class VocabBuilderMixin:
             }
             if freedom >= free_relaxed:
                 vocab_relaxed[w] = entry
-            if coh >= coh_strict and freedom >= free_strict:
+            # 标准路径：凝固度和自由度都达标
+            if (coh >= coh_strict * len_discount
+                    and freedom >= free_strict):
+                vocab[w] = entry
+            # 救回路径：单项大幅超标可补偿另一项
+            elif (coh >= coh_strict * len_discount * 2
+                  and freedom >= free_relaxed):
+                vocab[w] = entry
+            elif (freedom >= free_strict * 2
+                  and coh >= coh_relaxed * len_discount):
                 vocab[w] = entry
 
         self._filter_extensions(vocab, freq)
@@ -150,14 +160,20 @@ class VocabBuilderMixin:
     def _filter_extensions(self, vocab: dict, freq: Counter,
                            lenient: bool = False):
         """清洗"伪合成词"：散字粘连 / 短语拼合。
+
         阈值从类常量 FILTER_COH_* / FILTER_DOM_* 读取。
+        边界熵保护：如果词的自由度足够高，说明它被当作独立单元使用，
+        即使可拆分也保留。
         """
         coh_threshold = self.FILTER_COH_LENIENT if lenient else self.FILTER_COH_STRICT
         dom_threshold = self.FILTER_DOM_LENIENT if lenient else self.FILTER_DOM_STRICT
+        free_protect = self.VOCAB_FREE_STRICT
 
         to_remove: set = set()
         for w in list(vocab):
             if len(w) < 3:
+                continue
+            if len(w) <= 4 and vocab[w]['freedom'] >= free_protect:
                 continue
             f_w = vocab[w]['freq']
 
