@@ -3,7 +3,8 @@
 
 阶段一  build_index  — 全文词汇发现（与关键词无关，只需执行一次）
                        实现见 _vocab_builder.py → VocabBuilderMixin
-阶段二  _strategy_*  — 四策略并行候选提取（字符包含 / 上下文 / 共现 / 构词）
+阶段二  _strategy_*  — 六策略并行候选提取
+                       字符包含 / 上下文 / 共现 / 构词 / 互替 / 段落共主题
                        实现见 _strategies.py  → StrategiesMixin
 阶段三  extract      — 多信号归一化融合 + 交叉验证加分 + 后处理（本文件）
 """
@@ -23,7 +24,8 @@ MODE_PRESETS = {
         'min_freq': 3, 'min_freq_range': (2, 50),
         'max_freq': 0,
         'top_n': 75,
-        'w_char': 0.25, 'w_context': 0.40, 'w_cooccur': 0.40, 'w_morph': 0.15,
+        'w_char': 0.25, 'w_context': 0.40, 'w_cooccur': 0.40,
+        'w_morph': 0.15, 'w_subst': 0.30, 'w_topic': 0.25,
     },
     'high_freq': {
         'label': '高频模式（≥800次）',
@@ -31,7 +33,8 @@ MODE_PRESETS = {
         'min_freq': 800, 'min_freq_range': (100, 2000),
         'max_freq': 0,
         'top_n': 75,
-        'w_char': 0.25, 'w_context': 0.40, 'w_cooccur': 0.40, 'w_morph': 0.15,
+        'w_char': 0.25, 'w_context': 0.40, 'w_cooccur': 0.40,
+        'w_morph': 0.15, 'w_subst': 0.30, 'w_topic': 0.25,
     },
     'low_freq': {
         'label': '低频模式（≤20次）',
@@ -39,7 +42,8 @@ MODE_PRESETS = {
         'min_freq': 2, 'min_freq_range': (2, 10),
         'max_freq': 100,
         'top_n': 150,
-        'w_char': 0.30, 'w_context': 0.25, 'w_cooccur': 0.15, 'w_morph': 0.30,
+        'w_char': 0.15, 'w_context': 0.5, 'w_cooccur': 0.4,
+        'w_morph': 0.1, 'w_subst': 0.25, 'w_topic': 0.30,
     },
 }
 
@@ -95,6 +99,7 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
     def extract(self, keyword: str, top_n: int = 75, min_freq: int = 2,
                 w_char: float = 0.25, w_context: float = 0.40,
                 w_cooccur: float = 0.40, w_morph: float = 0.15,
+                w_subst: float = 0.30, w_topic: float = 0.25,
                 mode: str = 'balanced', max_freq: int = 0) -> list[dict]:
         if not self._built:
             raise RuntimeError('请先调用 build_index(text)')
@@ -106,7 +111,10 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
         n_context = _normalize(raw_scores['context_pattern'])
         n_cooccur = _normalize(raw_scores['cooccurrence'])
         n_morph = _normalize(raw_scores['morpheme'])
-        all_words = set(n_char) | set(n_context) | set(n_cooccur) | set(n_morph)
+        n_subst = _normalize(raw_scores['substitution'])
+        n_topic = _normalize(raw_scores['co_topic'])
+        all_words = (set(n_char) | set(n_context) | set(n_cooccur)
+                     | set(n_morph) | set(n_subst) | set(n_topic))
 
         miss = self.MISS_PENALTY
         results = []
@@ -121,10 +129,14 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
             s_context = n_context.get(word, miss)
             s_cooccur = n_cooccur.get(word, miss)
             s_morph = n_morph.get(word, miss)
+            s_subst = n_subst.get(word, miss)
+            s_topic = n_topic.get(word, miss)
 
             score = (w_char * s_char + w_context * s_context
-                     + w_cooccur * s_cooccur + w_morph * s_morph)
-            hits = sum(1 for s in (s_char, s_context, s_cooccur, s_morph) if s > 0)
+                     + w_cooccur * s_cooccur + w_morph * s_morph
+                     + w_subst * s_subst + w_topic * s_topic)
+            hits = sum(1 for s in (s_char, s_context, s_cooccur,
+                                   s_morph, s_subst, s_topic) if s > 0)
             score += self.CROSS_BONUS * max(0, hits - 1)
 
             labels = []
@@ -136,6 +148,10 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
                 labels.append('共现')
             if s_morph > 0:
                 labels.append('构词')
+            if s_subst > 0:
+                labels.append('互替')
+            if s_topic > 0:
+                labels.append('共主题')
 
             results.append({
                 'word': word,
@@ -159,7 +175,7 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
                 'freq': kw_freq,
                 'score': 9999.0,
                 'strategies': '用户输入',
-                'hit_count': 4,
+                'hit_count': 6,
                 'matched_patterns': '',
             }
             results = [kw_entry] + results
@@ -173,8 +189,9 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
     def _run_strategies(self, keyword: str, mode: str, vocab: dict):
         """返回 (raw_scores_dict, pattern_info)
 
-        raw_scores_dict 的 key 固定为四个策略名：
-          char_overlap / context_pattern / cooccurrence / morpheme
+        raw_scores_dict 的 key 固定为六个策略名：
+          char_overlap / context_pattern / cooccurrence /
+          morpheme / substitution / co_topic
         """
         res_char = self._strategy_char_overlap(keyword, vocab)
         res_morph = self._strategy_morpheme(keyword, vocab)
@@ -188,52 +205,47 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
     def _run_balanced(self, keyword, vocab, raw_char, raw_morph):
         """均衡 / 高频模式：单跳 + 小幅扩展"""
         if self._find_all(keyword):
-            res_ctx = self._strategy_context_pattern([keyword], vocab)
-            raw_context = res_ctx.scores
-            pattern_info = res_ctx.meta.get('patterns', {})
-            raw_cooccur = self._strategy_cooccurrence([keyword], vocab).scores
-            if raw_context and len(raw_context) < 20:
-                top_seeds = sorted(raw_context, key=raw_context.get,
-                                   reverse=True)[:5]
-                extra = self._strategy_context_pattern(top_seeds, vocab)
-                for w, s in extra.scores.items():
-                    raw_context[w] = max(raw_context.get(w, 0), s)
-                    extra_p = extra.meta.get('patterns', {})
-                    if w in extra_p:
-                        existing = set(pattern_info.get(w, []))
-                        pattern_info[w] = sorted(existing | set(extra_p[w]))
+            seeds = [keyword]
         else:
             combined = {
                 w: raw_char.get(w, 0) + raw_morph.get(w, 0)
                 for w in set(raw_char) | set(raw_morph)
             }
-            surrogates = sorted(combined, key=combined.get, reverse=True)[:5]
-            if surrogates:
-                res_ctx = self._strategy_context_pattern(surrogates, vocab)
-                raw_context = res_ctx.scores
-                pattern_info = res_ctx.meta.get('patterns', {})
-                raw_cooccur = self._strategy_cooccurrence(
-                    surrogates, vocab).scores
-            else:
-                raw_context, pattern_info, raw_cooccur = {}, {}, {}
+            seeds = sorted(combined, key=combined.get, reverse=True)[:5]
+
+        if seeds:
+            res_ctx = self._strategy_context_pattern(seeds, vocab)
+            raw_context = res_ctx.scores
+            pattern_info = res_ctx.meta.get('patterns', {})
+            raw_cooccur = self._strategy_cooccurrence(seeds, vocab).scores
+            raw_subst = self._strategy_substitution(seeds, vocab).scores
+            raw_topic = self._strategy_co_topic(seeds, vocab).scores
+        else:
+            raw_context, pattern_info = {}, {}
+            raw_cooccur, raw_subst, raw_topic = {}, {}, {}
 
         return {
             'char_overlap': raw_char,
             'context_pattern': raw_context,
             'cooccurrence': raw_cooccur,
             'morpheme': raw_morph,
+            'substitution': raw_subst,
+            'co_topic': raw_topic,
         }, pattern_info
 
     def _run_low_freq(self, keyword, vocab, raw_char, raw_morph):
         """低频模式：两跳发散——先结构匹配，再用候选词做种子上下文扩展"""
         if self._find_all(keyword):
-            res_ctx = self._strategy_context_pattern([keyword], vocab)
+            seeds = [keyword]
+            res_ctx = self._strategy_context_pattern(seeds, vocab)
             raw_context = res_ctx.scores
             pattern_info = res_ctx.meta.get('patterns', {})
-            raw_cooccur = self._strategy_cooccurrence([keyword], vocab).scores
+            raw_cooccur = self._strategy_cooccurrence(seeds, vocab).scores
+            raw_subst = self._strategy_substitution(seeds, vocab).scores
+            raw_topic = self._strategy_co_topic(seeds, vocab).scores
         else:
             raw_context, pattern_info = {}, {}
-            raw_cooccur = {}
+            raw_cooccur, raw_subst, raw_topic = {}, {}, {}
 
         hop1 = {}
         for w in set(raw_char) | set(raw_morph):
@@ -246,9 +258,12 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
 
         if hop1_seeds:
             hop2_ctx = self._strategy_context_pattern(
-                hop1_seeds, vocab, _max_tpl=8, _max_pos=200)
+                hop1_seeds, vocab, _max_scan=200)
             hop2_cooccur = self._strategy_cooccurrence(
                 hop1_seeds, vocab, _max_occ=100)
+            hop2_subst = self._strategy_substitution(
+                hop1_seeds, vocab, _max_scan=200)
+            hop2_topic = self._strategy_co_topic(hop1_seeds, vocab)
 
             decay = self.HOP2_DECAY
             for w, s in hop2_ctx.scores.items():
@@ -260,12 +275,18 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
                         existing | set(hop2_patterns[w]))
             for w, s in hop2_cooccur.scores.items():
                 raw_cooccur[w] = max(raw_cooccur.get(w, 0), s * decay)
+            for w, s in hop2_subst.scores.items():
+                raw_subst[w] = max(raw_subst.get(w, 0), s * decay)
+            for w, s in hop2_topic.scores.items():
+                raw_topic[w] = max(raw_topic.get(w, 0), s * decay)
 
         return {
             'char_overlap': raw_char,
             'context_pattern': raw_context,
             'cooccurrence': raw_cooccur,
             'morpheme': raw_morph,
+            'substitution': raw_subst,
+            'co_topic': raw_topic,
         }, pattern_info
 
     @staticmethod

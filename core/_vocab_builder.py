@@ -2,12 +2,13 @@
 阶段一：全文词汇发现
 
 VocabBuilderMixin 提供：
-  build_index        — 扫描全文，构建词频表、邻字表、词表
-  _cohesion          — 计算词的凝固度（PMI 变体）
-  _filter_extensions — 清洗伪合成词（散字粘连 / 短语拼合）
-  _find_all          — 在全文中找子串所有出现位置
-  _vocab_after       — 从指定位置向后匹配词表词
-  _vocab_before      — 从指定位置向前匹配词表词
+  build_index           — 扫描全文，构建词频表、邻字表、词表、段落索引
+  _build_segment_index  — 构建段落级词分布索引（供共主题策略使用）
+  _cohesion             — 计算词的凝固度（PMI 变体）
+  _filter_extensions    — 清洗伪合成词（散字粘连 / 短语拼合）
+  _find_all             — 在全文中找子串所有出现位置
+  _vocab_after          — 从指定位置向后匹配词表词
+  _vocab_before         — 从指定位置向前匹配词表词
 
 所有阈值参数通过 TermExtractor 的类常量读取（self.VOCAB_COH_STRICT 等），
 不在本文件中硬编码。
@@ -99,7 +100,40 @@ class VocabBuilderMixin:
         self._char_index = dict(char_idx)
         self._bigram_index = dict(bigram_idx)
 
+        self._build_segment_index(vocab_relaxed)
         self._built = True
+
+    # ------------------------------------------------------------------ #
+    # 段落级索引（供共主题策略使用）                                            #
+    # ------------------------------------------------------------------ #
+
+    _SEG_SIZE = 500
+
+    def _build_segment_index(self, vocab: dict):
+        """扫描全文，记录每个词表词出现在哪些段落片段中。
+
+        按固定 _SEG_SIZE 字符切段，每段大致对应一个自然段/场景。
+        """
+        text = self._text
+        seg_size = self._SEG_SIZE
+        n_segs = max(1, (self._text_len + seg_size - 1) // seg_size)
+
+        word_segs: dict[str, set[int]] = defaultdict(set)
+        min_l, max_l = self.min_len, self.max_len
+
+        for m in _RE_CHINESE.finditer(text):
+            seq = m.group()
+            base = m.start()
+            n = len(seq)
+            for i in range(n):
+                sid = (base + i) // seg_size
+                for length in range(min_l, min(max_l + 1, n - i + 1)):
+                    w = seq[i:i + length]
+                    if w in vocab:
+                        word_segs[w].add(sid)
+
+        self._word_segs: dict[str, set[int]] = dict(word_segs)
+        self._n_segments: int = n_segs
 
     def _cohesion(self, word: str) -> float:
         """词的凝固度：所有切分点上 PMI 的最小值"""

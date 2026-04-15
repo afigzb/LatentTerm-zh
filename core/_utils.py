@@ -21,7 +21,7 @@ _RE_PURE_CHINESE = re.compile(r'^[\u4e00-\u9fff]+$')
 
 @dataclass
 class StrategyResult:
-    """四策略的统一返回类型。
+    """六策略的统一返回类型。
     scores  — 候选词 → 原始分数
     meta    — 策略附带的额外信息（如上下文模板命中详情）
     """

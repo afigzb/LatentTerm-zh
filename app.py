@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from core.text_cleaner import clean_text
 from core.term_extractor import TermExtractor, MODE_PRESETS
+from core.dict_filter import DictFilter
 
 st.set_page_config(page_title="AIWA 文本调试台", layout="wide")
 st.title("AIWA 2.0 - 文本调试台")
@@ -77,6 +78,9 @@ if uploaded_file is not None:
             extractor = TermExtractor(min_len=2, max_len=8)
             extractor.build_index(cleaned_text)
 
+            if "dict_filter" not in st.session_state:
+                st.session_state["dict_filter"] = DictFilter()
+
             st.session_state["file_id"] = file_id
             st.session_state["cleaned_text"] = cleaned_text
             st.session_state["raw_text"] = raw_text
@@ -146,7 +150,7 @@ if uploaded_file is not None:
             )
         with col_top:
             top_n = st.slider(
-                "最多展示条数", min_value=10, max_value=1000,
+                "最多展示条数", min_value=10, max_value=10000,
                 value=cfg['top_n'], key=f"top_n_{mode}",
             )
 
@@ -160,20 +164,27 @@ if uploaded_file is not None:
             )
 
         with st.expander("策略权重调节", expanded=False):
-            st.caption("调节四种提取策略的权重，权重越高该策略对排序的影响越大。")
-            wc1, wc2, wc3, wc4 = st.columns(4)
-            with wc1:
+            st.caption("调节六种提取策略的权重，权重越高该策略对排序的影响越大。")
+            wr1, wr2, wr3 = st.columns(3)
+            with wr1:
                 w_char = st.slider("字符包含", 0.0, 1.0, cfg['w_char'], 0.05,
                                    key=f"w_char_{mode}")
-            with wc2:
+            with wr2:
                 w_context = st.slider("上下文模式", 0.0, 1.0, cfg['w_context'], 0.05,
                                       key=f"w_context_{mode}")
-            with wc3:
+            with wr3:
                 w_cooccur = st.slider("共现近邻", 0.0, 1.0, cfg['w_cooccur'], 0.05,
                                       key=f"w_cooccur_{mode}")
-            with wc4:
+            wr4, wr5, wr6 = st.columns(3)
+            with wr4:
                 w_morph = st.slider("构词结构", 0.0, 1.0, cfg['w_morph'], 0.05,
                                     key=f"w_morph_{mode}")
+            with wr5:
+                w_subst = st.slider("互替性", 0.0, 1.0, cfg['w_subst'], 0.05,
+                                    key=f"w_subst_{mode}")
+            with wr6:
+                w_topic = st.slider("段落共主题", 0.0, 1.0, cfg['w_topic'], 0.05,
+                                    key=f"w_topic_{mode}")
 
         if keyword:
             spinner_msg = f"正在以{cfg['label']}提取与「{keyword}」相关的术语……"
@@ -182,6 +193,7 @@ if uploaded_file is not None:
                     keyword, top_n=top_n, min_freq=min_freq,
                     w_char=w_char, w_context=w_context,
                     w_cooccur=w_cooccur, w_morph=w_morph,
+                    w_subst=w_subst, w_topic=w_topic,
                     mode=mode, max_freq=max_freq,
                 )
 
@@ -191,6 +203,9 @@ if uploaded_file is not None:
                     "请尝试降低最低频次或更换关键词。"
                 )
             else:
+                dict_filter: DictFilter = st.session_state["dict_filter"]
+                dict_filter.tag_results(results)
+
                 pinned = results[0] if results[0].get('strategies') == '用户输入' else None
                 algo_results = results[1:] if pinned else results
 
@@ -211,11 +226,64 @@ if uploaded_file is not None:
                            f"（{len(algo_results)} 个主词 + "
                            f"{algo_count - len(algo_results)} 个从属子术语）")
 
-                if results:
+                # ── 词典过滤控件 ──
+                with st.expander("📖 词典过滤", expanded=False):
+                    enable_filter = st.checkbox(
+                        "启用词典过滤",
+                        value=False,
+                        help="基于 jieba 词典的词性标注，过滤通用词汇，保留领域专有术语",
+                    )
+                    if enable_filter:
+                        st.caption(
+                            "勾选要**过滤掉**的词性分组（不在词典中的词标记为「未收录」，"
+                            "通常是领域专有术语）"
+                        )
+                        fc1, fc2, fc3, fc4 = st.columns(4)
+                        with fc1:
+                            f_verb = st.checkbox("动词", value=True, key="f_verb")
+                            f_adj  = st.checkbox("形容词", value=True, key="f_adj")
+                            f_adv  = st.checkbox("副词", value=True, key="f_adv")
+                        with fc2:
+                            f_pron = st.checkbox("代词", value=True, key="f_pron")
+                            f_num  = st.checkbox("数量词", value=True, key="f_num")
+                            f_func = st.checkbox("虚词", value=True, key="f_func")
+                        with fc3:
+                            f_loc  = st.checkbox("方位时间", value=True, key="f_loc")
+                            f_noun = st.checkbox(
+                                "通用名词", value=False, key="f_noun",
+                                help="开启后过滤力度较大，常见名词也会被移除",
+                            )
+                        with fc4:
+                            f_proper = st.checkbox("专有名词", value=False, key="f_proper")
+                            f_idiom  = st.checkbox("成语习语", value=False, key="f_idiom")
+
+                        excluded = set()
+                        if f_verb:   excluded.add("动词")
+                        if f_adj:    excluded.add("形容词")
+                        if f_adv:    excluded.add("副词")
+                        if f_pron:   excluded.add("代词")
+                        if f_num:    excluded.add("数量词")
+                        if f_func:   excluded.add("虚词")
+                        if f_loc:    excluded.add("方位时间")
+                        if f_noun:   excluded.add("通用名词")
+                        if f_proper: excluded.add("专有名词")
+                        if f_idiom:  excluded.add("成语习语")
+                    else:
+                        excluded = set()
+
+                if enable_filter and excluded:
+                    display_results, removed_results = dict_filter.filter_results(
+                        results, excluded)
+                else:
+                    display_results = results
+                    removed_results = []
+
+                if display_results:
                     flat_rows = []
-                    for r in results:
+                    for r in display_results:
                         flat_rows.append({
                             '词语': r['word'],
+                            '词性': r.get('pos_group', ''),
                             '出现频次': r['freq'],
                             '综合评分': r['score'],
                             '命中策略': r['strategies'],
@@ -239,10 +307,11 @@ if uploaded_file is not None:
                         height=600,
                     )
 
-                    has_children = any(r.get('children') for r in results)
+                    has_children = any(
+                        r.get('children') for r in display_results)
                     if has_children:
                         with st.expander("展开查看子术语详情"):
-                            for r in results:
+                            for r in display_results:
                                 children = r.get('children', [])
                                 if not children:
                                     continue
@@ -250,6 +319,7 @@ if uploaded_file is not None:
                                 child_df = pd.DataFrame([
                                     {
                                         '子术语': c['word'],
+                                        '词性': c.get('pos_group', ''),
                                         '出现频次': c['freq'],
                                         '综合评分': c['score'],
                                         '命中策略': c['strategies'],
@@ -259,9 +329,28 @@ if uploaded_file is not None:
                                 child_df.index = child_df.index + 1
                                 st.dataframe(child_df, use_container_width=True)
 
+                    if removed_results:
+                        with st.expander(
+                            f"已过滤的词（{len(removed_results)} 个）"
+                        ):
+                            removed_rows = []
+                            for r in removed_results:
+                                removed_rows.append({
+                                    '词语': r['word'],
+                                    '词性': r.get('pos_group', ''),
+                                    '出现频次': r['freq'],
+                                    '综合评分': r['score'],
+                                    '命中策略': r['strategies'],
+                                })
+                            removed_df = pd.DataFrame(removed_rows)
+                            removed_df.index = removed_df.index + 1
+                            st.dataframe(removed_df, use_container_width=True)
+
                     st.caption(
+                        "**词性**：基于 jieba 词典标注，「未收录」通常是领域专有术语　｜　"
                         "**命中策略**：字符=字符包含、上下文=上下文模式引导、"
-                        "共现=共现近邻、构词=构词结构相似　｜　"
+                        "共现=共现近邻、构词=构词结构相似、互替=上下文互替性、"
+                        "共主题=段落级共现　｜　"
                         "**命中数**：被几种策略同时发现（越多越可信）　｜　"
                         "**匹配模式**：命中的上下文模板　｜　"
                         "**子术语**：包含该主词的更长术语（从属关系）"

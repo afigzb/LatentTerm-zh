@@ -1,11 +1,13 @@
 """
-阶段二：四策略并行候选提取
+阶段二：六策略并行候选提取
 
 StrategiesMixin 提供：
   _strategy_char_overlap    — 字符包含：从词表中找包含关键词字符的词，按位置加权
-  _strategy_context_pattern — 上下文模式引导：学习种子词的上下文模板，用模板发现新词
+  _strategy_context_pattern — 上下文特征投票：提取种子词上下文指纹（最宽8字），反向投票发现语义相似词
   _strategy_cooccurrence    — 共现近邻：统计在种子词附近高频出现的词（Lift 比率）
   _strategy_morpheme        — 构词结构相似：找与关键词共享核心语素且处于相同位置的词
+  _strategy_substitution    — 互替性：找能在相同上下文框架中替换种子词的词
+  _strategy_co_topic        — 段落共主题：找与种子词在段落级别高度共现的词
 
 所有策略统一接收 vocab 参数、统一返回 StrategyResult。
 """
@@ -13,7 +15,7 @@ StrategiesMixin 提供：
 import math
 from collections import Counter
 
-from ._utils import _RE_CHINESE, _RE_PURE_CHINESE, _clean_boundary, StrategyResult
+from ._utils import _RE_CHINESE, _clean_boundary, StrategyResult
 
 
 class StrategiesMixin:
@@ -50,96 +52,136 @@ class StrategiesMixin:
             scores[word] = char_ratio * pos_match * freq_w
         return StrategyResult(scores)
 
+    # 特征宽度权重：1字×0.3, 2字×1.0, 3字×1.7, 4字×2.2, 5字×2.6, 6字×3.0,
+    #              7字×3.3, 8字×3.6
+    _WIDTH_MULT = (0.0, 0.3, 1.0, 1.7, 2.2, 2.6, 3.0, 3.3, 3.6)
+    _PAIR_MULT = 2.5
+
     def _strategy_context_pattern(self, seeds: list[str], vocab: dict,
-                                  _max_tpl: int = 15,
-                                  _max_pos: int = 500,
-                                  _max_gap: int = 4) -> StrategyResult:
-        """上下文模式引导：学习种子词左右模板，在全文中匹配新词"""
-        left_tpl: Counter = Counter()
-        right_tpl: Counter = Counter()
-        for seed in seeds:
-            positions = self._find_all(seed)
-            for pos in positions:
-                end = pos + len(seed)
-                for cl in range(2, 5):
-                    if pos >= cl:
-                        lc = self._text[pos - cl:pos]
-                        if _RE_PURE_CHINESE.match(lc):
-                            left_tpl[lc] += 1
-                    if end + cl <= self._text_len:
-                        rc = self._text[end:end + cl]
-                        if _RE_PURE_CHINESE.match(rc):
-                            right_tpl[rc] += 1
+                                  _max_scan: int = 600) -> StrategyResult:
+        """上下文特征投票：提取种子词多宽度上下文指纹，反向投票发现语义相似词
 
-        min_pf = 2
-        lt = {p: c for p, c in left_tpl.items() if c >= min_pf}
-        rt = {p: c for p, c in right_tpl.items() if c >= min_pf}
-        if len(lt) + len(rt) < 3:
-            lt, rt = dict(left_tpl), dict(right_tpl)
-
-        lt_scored: dict[str, float] = {}
-        for tmpl, seed_count in lt.items():
-            total_count = len(self._find_all(tmpl))
-            specificity = seed_count / max(total_count, 1)
-            lt_scored[tmpl] = seed_count * (1.0 + specificity)
-        rt_scored: dict[str, float] = {}
-        for tmpl, seed_count in rt.items():
-            total_count = len(self._find_all(tmpl))
-            specificity = seed_count / max(total_count, 1)
-            rt_scored[tmpl] = seed_count * (1.0 + specificity)
-
-        lt = dict(sorted(lt_scored.items(),
-                         key=lambda x: x[1], reverse=True)[:_max_tpl])
-        rt = dict(sorted(rt_scored.items(),
-                         key=lambda x: x[1], reverse=True)[:_max_tpl])
-
-        decay = self.CONTEXT_DECAY
-        cands: dict[str, dict] = {}
+        算法：
+        1. 遍历种子词出现位置，提取 1-8 字左/右上下文特征，
+           以及 (左1-2字, 右1-2字) 配对特征
+        2. 按 IDF × 宽度权重 加权，取 top-K
+        3. 对每个高权重特征反向投票
+        4. 得分 = 投票总分 × sqrt(命中特征种数) / log2(词频+2)
+        """
+        text = self._text
+        text_len = self._text_len
         seed_set = set(seeds)
 
-        for tmpl, tw in lt.items():
-            positions = self._find_all(tmpl)
-            if len(positions) > _max_pos:
-                positions = positions[::len(positions) // _max_pos + 1]
-            for tpos in positions:
-                base = tpos + len(tmpl)
-                for gap in range(_max_gap + 1):
-                    hits = self._vocab_after(base + gap, vocab)
-                    if not hits:
-                        continue
-                    gap_w = decay ** gap
-                    for w in hits:
-                        if w not in seed_set:
-                            if w not in cands:
-                                cands[w] = {'score': 0.0, 'patterns': set()}
-                            cands[w]['score'] += tw * gap_w
-                            cands[w]['patterns'].add(f'{tmpl}…')
-                    break
+        def _cjk(ch: str) -> bool:
+            return '\u4e00' <= ch <= '\u9fff'
 
-        for tmpl, tw in rt.items():
-            positions = self._find_all(tmpl)
-            if len(positions) > _max_pos:
-                positions = positions[::len(positions) // _max_pos + 1]
-            for tpos in positions:
-                for gap in range(_max_gap + 1):
-                    hits = self._vocab_before(tpos - gap, vocab)
-                    if not hits:
-                        continue
-                    gap_w = decay ** gap
-                    for w in hits:
-                        if w not in seed_set:
-                            if w not in cands:
-                                cands[w] = {'score': 0.0, 'patterns': set()}
-                            cands[w]['score'] += tw * gap_w
-                            cands[w]['patterns'].add(f'…{tmpl}')
-                    break
+        # ── 1. 提取种子上下文特征（1-10字 + 配对）──
+        feat_left: Counter = Counter()
+        feat_right: Counter = Counter()
+        feat_pair: Counter = Counter()
 
+        n_occ = 0
+        for seed in seeds:
+            positions = self._find_all(seed)
+            n_occ += len(positions)
+            slen = len(seed)
+            for pos in positions:
+                end = pos + slen
+                lfs: list[str] = []
+                for w in range(1, 9):
+                    if pos < w or not _cjk(text[pos - w]):
+                        break
+                    lfs.append(text[pos - w:pos])
+                rfs: list[str] = []
+                for w in range(1, 9):
+                    if end + w > text_len or not _cjk(text[end + w - 1]):
+                        break
+                    rfs.append(text[end:end + w])
+
+                for f in lfs: feat_left[f] += 1
+                for f in rfs: feat_right[f] += 1
+                for lc in lfs[:2]:
+                    for rc in rfs[:2]:
+                        feat_pair[(lc, rc)] += 1
+
+        if n_occ == 0:
+            return StrategyResult({})
+
+        # ── 2. IDF × 宽度权重，取 top-K ──
+        freq_map = self._freq
+        wm = self._WIDTH_MULT
+
+        def _idf_top(counts: Counter, top_k: int) -> dict:
+            scored = {}
+            for feat, cnt in counts.items():
+                gf = freq_map.get(feat) or len(self._find_all(feat))
+                idf = math.log2(max(text_len / max(gf, 1), 1.0))
+                scored[feat] = cnt * idf * wm[len(feat)]
+            return dict(sorted(scored.items(),
+                               key=lambda x: x[1], reverse=True)[:top_k])
+
+        wL = _idf_top(feat_left, 30)
+        wR = _idf_top(feat_right, 30)
+
+        pm = self._PAIR_MULT
+        wP: dict[tuple, float] = {}
+        for (lc, rc), cnt in feat_pair.items():
+            gf = min(freq_map.get(lc, 1), freq_map.get(rc, 1))
+            idf = math.log2(max(text_len / max(gf, 1), 1.0))
+            wP[(lc, rc)] = cnt * idf * pm
+        wP = dict(sorted(wP.items(),
+                         key=lambda x: x[1], reverse=True)[:15])
+
+        # ── 3. 反向投票 ──
+        votes: dict[str, float] = {}
+        feats_hit: dict[str, set] = {}
+
+        def _cap(positions: list) -> list:
+            if len(positions) > _max_scan:
+                return positions[::len(positions) // _max_scan + 1]
+            return positions
+
+        def _vote(word: str, weight: float, label: str):
+            votes[word] = votes.get(word, 0) + weight
+            feats_hit.setdefault(word, set()).add(label)
+
+        for feat, wt in wL.items():
+            flen = len(feat)
+            for p in _cap(self._find_all(feat)):
+                for w in self._vocab_after(p + flen, vocab):
+                    if w not in seed_set:
+                        _vote(w, wt, f'{feat}…')
+
+        for feat, wt in wR.items():
+            for p in _cap(self._find_all(feat)):
+                for w in self._vocab_before(p, vocab):
+                    if w not in seed_set:
+                        _vote(w, wt, f'…{feat}')
+
+        for (lc, rc), wt in wP.items():
+            llen = len(lc)
+            rlen = len(rc)
+            for p in _cap(self._find_all(lc)):
+                for w in self._vocab_after(p + llen, vocab):
+                    if w in seed_set:
+                        continue
+                    w_end = p + llen + len(w)
+                    if (w_end + rlen <= text_len
+                            and text[w_end:w_end + rlen] == rc):
+                        _vote(w, wt, f'{lc}…{rc}')
+
+        # ── 4. 归一化得分 ──
         scores: dict[str, float] = {}
         patterns: dict[str, list] = {}
-        for w, info in cands.items():
-            np_ = len(info['patterns'])
-            scores[w] = info['score'] * math.sqrt(np_)
-            patterns[w] = sorted(info['patterns'])
+        for w, raw in votes.items():
+            v = vocab.get(w)
+            if not v:
+                continue
+            nf = len(feats_hit.get(w, ()))
+            scores[w] = raw * math.sqrt(max(nf, 1)) / math.log2(
+                v['freq'] + 2)
+            patterns[w] = sorted(feats_hit.get(w, ()))
+
         return StrategyResult(scores, meta={'patterns': patterns})
 
     _SENT_BREAKS = frozenset('。！？…\n')
@@ -267,5 +309,140 @@ class StrategiesMixin:
                 freq_w = math.log2(vocab[word]['freq'] + 1)
                 scores[word] = scores.get(word, 0) + \
                     base_weight * w_mult * freq_w
+
+        return StrategyResult(scores)
+
+    # 框架宽度配置：(左宽, 右宽, 权重)
+    # 双侧2字框架最具区分度，单侧1字作为补充覆盖
+    _FRAME_SPECS = ((2, 2, 2.5), (2, 1, 1.5), (1, 2, 1.5), (1, 1, 1.0))
+
+    def _strategy_substitution(self, seeds: list[str], vocab: dict,
+                               _max_scan: int = 400) -> StrategyResult:
+        """互替性：找能在相同上下文框架中替换种子词的词
+
+        算法：
+        1. 在种子词每个出现位置，提取多宽度 (左n字, 右n字) 上下文框架
+        2. 对每个框架，在全文中搜索能填入该框架的其他词表词
+        3. 得分 = 共享框架加权总分 × sqrt(覆盖率)
+
+        与 context_pattern 的区别：
+          context_pattern 逐特征独立投票（左特征和右特征各自匹配）
+          substitution 要求左右两侧同时匹配（完整框架），衡量的是
+          "候选词能替换种子词出现在多少种上下文中"
+        """
+        text = self._text
+        text_len = self._text_len
+        seed_set = set(seeds)
+
+        def _all_cjk(s: str) -> bool:
+            for c in s:
+                if not ('\u4e00' <= c <= '\u9fff'):
+                    return False
+            return True
+
+        # ── 1. 收集种子词的上下文框架 ──
+        seed_frames: dict[tuple[str, str], float] = {}
+
+        for seed in seeds:
+            slen = len(seed)
+            for pos in self._find_all(seed):
+                end = pos + slen
+                for lw, rw, fw in self._FRAME_SPECS:
+                    ls = pos - lw
+                    re = end + rw
+                    if ls < 0 or re > text_len:
+                        continue
+                    left = text[ls:pos]
+                    right = text[end:re]
+                    if not _all_cjk(left) or not _all_cjk(right):
+                        continue
+                    frame = (left, right)
+                    seed_frames[frame] = seed_frames.get(frame, 0) + fw
+
+        if not seed_frames:
+            return StrategyResult({})
+
+        n_frames = len(seed_frames)
+
+        # ── 2. 对每个框架，搜索可替换词 ──
+        word_frames: dict[str, set[tuple[str, str]]] = {}
+        word_weight: dict[str, float] = {}
+
+        sorted_frames = sorted(seed_frames.items(),
+                               key=lambda x: x[1], reverse=True)
+
+        for (left, right), frame_w in sorted_frames:
+            llen = len(left)
+            rlen = len(right)
+            positions = self._find_all(left)
+            if len(positions) > _max_scan:
+                step = len(positions) // _max_scan + 1
+                positions = positions[::step]
+
+            for p in positions:
+                ws = p + llen
+                for w in self._vocab_after(ws, vocab):
+                    if w in seed_set:
+                        continue
+                    w_end = ws + len(w)
+                    if (w_end + rlen <= text_len
+                            and text[w_end:w_end + rlen] == right):
+                        word_frames.setdefault(w, set()).add((left, right))
+                        word_weight[w] = word_weight.get(w, 0) + frame_w
+
+        # ── 3. 计算得分 ──
+        scores: dict[str, float] = {}
+        for w, frames in word_frames.items():
+            n_shared = len(frames)
+            coverage = n_shared / max(n_frames, 1)
+            weighted = sum(seed_frames[f] for f in frames)
+            scores[w] = weighted * math.sqrt(coverage)
+
+        return StrategyResult(scores)
+
+    def _strategy_co_topic(self, seeds: list[str],
+                           vocab: dict) -> StrategyResult:
+        """段落共主题：找与种子词在段落级别高度共现的词
+
+        算法：
+        1. 收集种子词出现的段落集合 S_seed
+        2. 遍历词表，计算每个词 w 与 S_seed 的段落重叠度
+        3. 用段落级 Lift（实际重叠 / 随机预期重叠）衡量关联强度
+           得分 = (lift - 1) × log2(实际重叠段落数 + 1)
+
+        与 cooccurrence 的区别：
+          cooccurrence 看 50 字窗口内的句子级共现
+          co_topic 看 500 字段落级共现，捕获跨句、跨段的宏观主题关联
+        """
+        seed_segs: set[int] = set()
+        for s in seeds:
+            s_segs = self._word_segs.get(s)
+            if s_segs:
+                seed_segs |= s_segs
+
+        if not seed_segs:
+            return StrategyResult({})
+
+        n_seed = len(seed_segs)
+        n_total = self._n_segments
+        seed_set = set(seeds)
+
+        scores: dict[str, float] = {}
+        for w in vocab:
+            if w in seed_set:
+                continue
+            w_segs = self._word_segs.get(w)
+            if not w_segs:
+                continue
+            observed = len(seed_segs & w_segs)
+            if observed < 2:
+                continue
+            expected = n_seed * len(w_segs) / max(n_total, 1)
+            if expected < 0.5:
+                continue
+            lift = observed / max(expected, 0.01)
+            if lift <= 1.0:
+                continue
+            scores[w] = (lift - 1.0) * math.log2(observed + 1)
 
         return StrategyResult(scores)
