@@ -4,7 +4,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 _LEFT_NOISE = frozenset(
-    '的了着过地得也都就又还更不没于在从对把被让们些所其有这那和与或是'
+    '的了着过地得也都就又还更没于在从对把被让们些所其有这那和与或是'
     '向以为而'
 )
 _RIGHT_NOISE = frozenset(
@@ -15,14 +15,19 @@ _RIGHT_NOISE = frozenset(
 )
 _PHRASE_MARKERS = frozenset('的和与或是把被让将给')
 
-# 这些字出现在 5+ 字串的内部时，几乎一定是短语而非词。
-# 短词（2-4字）不受此限制（"不死""到来""着急"等合法）。
+# 小说常见"名字+对白动词"尾字。用于 vocab 构建时的额外审查，
+# 不加入 _RIGHT_NOISE（否则会误杀"传说""知道"等合法词）。
+_DIALOGUE_TRAIL = frozenset('说道问笑叫喊')
+
+# 这些字出现在 4+ 字串的内部（即 w[1:-1]）时，使用短词判断。
+# 2 字词的 w[1:-1] 为空，"着急""得到""了解"等合法词不受影响。
 _LONG_PHRASE_INTERIOR = frozenset(
+    '的地得'          # 结构助词
     '着了过'          # 动态助词
     '到在从向往'      # 介词
     '把被让将给'      # 处置/被动标记
     '我你他她它们'    # 代词
-    '个些位只'        # 量词
+    '个些位只次'        # 量词
 )
 
 _RE_CHINESE = re.compile(r'[\u4e00-\u9fff]+')
@@ -49,11 +54,11 @@ def _entropy(counter: Counter) -> float:
 def _normalize(scores: dict) -> dict:
     if not scores:
         return {}
-    vals = list(scores.values())
-    lo, hi = min(vals), max(vals)
-    if hi <= lo:
+    n = len(scores)
+    if n == 1:
         return {k: 1.0 for k in scores}
-    return {k: (v - lo) / (hi - lo) for k, v in scores.items()}
+    sorted_words = sorted(scores, key=scores.get, reverse=True)
+    return {w: 1.0 - i / (n - 1) for i, w in enumerate(sorted_words)}
 
 
 def _clean_boundary(word: str) -> bool:

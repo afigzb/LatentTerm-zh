@@ -52,15 +52,19 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
 
     # ── 集中管理的阈值与参数 ──────────────────────────────────────────────
 
-    # 词表构建（build_index 使用）
-    VOCAB_COH_STRICT = 0.08
+    # Pass 1 双重过滤（build_index 两步法使用）
+    SOLID_PMI_MIN = 1.0
+    SOLID_FREE_MIN = 0.1
+
+    # 词表构建（build_index 使用），log-PMI 尺度
+    VOCAB_COH_STRICT = 3.0
     VOCAB_FREE_STRICT = 0.1
-    VOCAB_COH_RELAXED = 0.03
+    VOCAB_COH_RELAXED = 1.5
     VOCAB_FREE_RELAXED = 0.03
 
-    # 伪合成词过滤（_filter_extensions 使用）
-    FILTER_COH_STRICT = 0.1
-    FILTER_COH_LENIENT = 0.05
+    # 伪合成词过滤（_filter_extensions 使用），log-PMI 尺度
+    FILTER_COH_STRICT = 3.0
+    FILTER_COH_LENIENT = 2.0
     FILTER_DOM_STRICT = 8
     FILTER_DOM_LENIENT = 20
 
@@ -77,6 +81,7 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
         self.max_len = max_len
         self._text: str = ''
         self._text_len: int = 0
+        self._total_chars: int = 0
         self._freq: Counter = Counter()
         self._left_nb: defaultdict = defaultdict(Counter)
         self._right_nb: defaultdict = defaultdict(Counter)
@@ -116,7 +121,7 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
         all_words = (set(n_char) | set(n_context) | set(n_cooccur)
                      | set(n_morph) | set(n_subst) | set(n_topic))
 
-        miss = self.MISS_PENALTY
+        miss = -0.03 if mode == 'low_freq' else self.MISS_PENALTY
         results = []
         for word in all_words:
             info = vocab.get(word)
@@ -247,14 +252,26 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
             raw_context, pattern_info = {}, {}
             raw_cooccur, raw_subst, raw_topic = {}, {}, {}
 
-        hop1 = {}
+        hop1_form = {}
         for w in set(raw_char) | set(raw_morph):
-            hop1[w] = raw_char.get(w, 0) + raw_morph.get(w, 0)
+            hop1_form[w] = raw_char.get(w, 0) + raw_morph.get(w, 0)
 
-        hop1_seeds = [
-            w for w in sorted(hop1, key=hop1.get, reverse=True)
+        form_seeds = [
+            w for w in sorted(hop1_form, key=hop1_form.get, reverse=True)
             if w != keyword and self._freq.get(w, 0) >= 2
         ][:5]
+
+        dist_pool = {}
+        for d in (raw_context, raw_cooccur, raw_subst, raw_topic):
+            for w, s in d.items():
+                if w != keyword and w not in hop1_form:
+                    dist_pool[w] = max(dist_pool.get(w, 0), s)
+        dist_seeds = [
+            w for w in sorted(dist_pool, key=dist_pool.get, reverse=True)
+            if self._freq.get(w, 0) >= 2
+        ][:3]
+
+        hop1_seeds = list(dict.fromkeys(form_seeds + dist_seeds))
 
         if hop1_seeds:
             hop2_ctx = self._strategy_context_pattern(
@@ -289,39 +306,75 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
             'co_topic': raw_topic,
         }, pattern_info
 
-    @staticmethod
-    def _group_by_parent(results: list[dict], noise=None) -> list[dict]:
-        """按包含关系分组，用噪声字判定谁是真正的父词。
+    _INDEP_FRAGMENT_THRESHOLD = 0.15
+    _INDEP_PHRASE_FREQ_RATIO = 0.05
 
-        short ⊂ long 时：
-          extra 全是噪声字 → short 是真术语，long 挂到 short 下面
-          extra 不全是噪声字 → long 是复合术语，short 挂到 long 下面
+    def _group_by_parent(self, results: list[dict]) -> list[dict]:
+        """按包含关系分组，用独立性比率判定谁是真正的父词。
+
+        independence(w) = clean_freq(w) / raw_freq(w)
+        衡量一个词有多少出现是"独立的"（不是更长词的一部分）。
+
+        short ⊂ long 时三条规则：
+          1. 短词独立性低（< 15%）→ 短词是长词的残片 → 合并到长词下
+          2. 短词独立性高 + 长词频次远低于短词（< 5%）→ 长词是临时短语 → 挂到短词下
+          3. 短词独立性高 + 长词频次也不低 → 两个独立术语，不合并
         """
-        if noise is None:
-            noise = _LEFT_NOISE | _RIGHT_NOISE
+        noise = _LEFT_NOISE | _RIGHT_NOISE
+        raw_freq = self._freq
         words = [r['word'] for r in results]
+        freq_map = {r['word']: r['freq'] for r in results}
         n = len(words)
         child_of: dict[int, int] = {}
 
         for i in range(n):
-            for j in range(n):
-                if i == j:
-                    continue
+            for j in range(i + 1, n):
                 wi, wj = words[i], words[j]
-                if len(wi) == len(wj) or wi not in wj:
+                if len(wi) == len(wj):
                     continue
 
-                short_idx, long_idx = (i, j) if len(wi) < len(wj) else (j, i)
-                short_w, long_w = words[short_idx], words[long_idx]
-
-                extra = long_w.replace(short_w, '', 1)
-                if all(ch in noise for ch in extra):
-                    parent_idx, child_idx = short_idx, long_idx
+                if len(wi) < len(wj):
+                    if wi not in wj:
+                        continue
+                    short_idx, long_idx = i, j
                 else:
-                    parent_idx, child_idx = long_idx, short_idx
+                    if wj not in wi:
+                        continue
+                    short_idx, long_idx = j, i
 
-                if child_idx not in child_of:
-                    child_of[child_idx] = parent_idx
+                short_w = words[short_idx]
+                long_w = words[long_idx]
+                short_clean = freq_map[short_w]
+                long_clean = freq_map[long_w]
+                short_raw = raw_freq.get(short_w, short_clean)
+                independence = short_clean / max(short_raw, 1)
+
+                if independence < self._INDEP_FRAGMENT_THRESHOLD:
+                    # 规则1：短词是长词的残片（如 雨浩→霍雨浩）
+                    parent_idx, child_idx = long_idx, short_idx
+                elif long_clean / max(short_clean, 1) < self._INDEP_PHRASE_FREQ_RATIO:
+                    # 规则2：长词是围绕短词的临时短语（如 王冬联手→王冬）
+                    parent_idx, child_idx = short_idx, long_idx
+                elif independence > 0.4:
+                    # 规则3：短词高度独立，两个术语不合并
+                    continue
+                else:
+                    # 中间地带：退回噪声字启发式
+                    extra = long_w.replace(short_w, '', 1)
+                    if all(ch in noise for ch in extra):
+                        parent_idx, child_idx = short_idx, long_idx
+                    else:
+                        parent_idx, child_idx = long_idx, short_idx
+
+                if child_idx in child_of:
+                    continue
+                child_r = results[child_idx]
+                parent_r = results[parent_idx]
+                # 规则1命中时跳过频率保护（残片必须合并）
+                if independence >= self._INDEP_FRAGMENT_THRESHOLD:
+                    if child_r['freq'] > parent_r['freq'] * 3:
+                        continue
+                child_of[child_idx] = parent_idx
 
         for r in results:
             r.setdefault('children', [])

@@ -170,6 +170,34 @@ class StrategiesMixin:
                             and text[w_end:w_end + rlen] == rc):
                         _vote(w, wt, f'{lc}…{rc}')
 
+        # ── 3.5 特征内嵌候选词提取 ──
+        # 与种子词强共现的词往往成为高权重特征的一部分（如"霍雨浩和"），
+        # 导致反向投票只能发现特征后/前的词，而非特征中内嵌的词本身。
+        min_l, max_l = self.min_len, self.max_len
+        for feat, wt in list(wL.items()) + list(wR.items()):
+            if len(feat) < min_l:
+                continue
+            for length in range(min_l, min(max_l + 1, len(feat) + 1)):
+                for start in range(len(feat) - length + 1):
+                    sub = feat[start:start + length]
+                    if sub in vocab and sub not in seed_set:
+                        embed_wt = wt * 0.6
+                        votes[sub] = votes.get(sub, 0) + embed_wt
+                        feats_hit.setdefault(sub, set()).add(
+                            f'[嵌]{feat}')
+        for (lc, rc), wt in wP.items():
+            for part in (lc, rc):
+                if len(part) < min_l:
+                    continue
+                for length in range(min_l, min(max_l + 1, len(part) + 1)):
+                    for start in range(len(part) - length + 1):
+                        sub = part[start:start + length]
+                        if sub in vocab and sub not in seed_set:
+                            embed_wt = wt * 0.4
+                            votes[sub] = votes.get(sub, 0) + embed_wt
+                            feats_hit.setdefault(sub, set()).add(
+                                f'[嵌]{lc}…{rc}')
+
         # ── 4. 归一化得分 ──
         scores: dict[str, float] = {}
         patterns: dict[str, list] = {}
@@ -248,7 +276,10 @@ class StrategiesMixin:
         for w, wc in window_counts.items():
             expected = vocab[w]['freq'] * n_windows / max(text_len, 1)
             lift = wc / max(expected, 0.01)
-            scores[w] = lift
+            lift_score = lift * math.log2(wc + 1)
+            cond_prob = wc / max(n_windows, 1)
+            cond_score = cond_prob * math.log2(wc + 1) * 10
+            scores[w] = max(lift_score, cond_score)
         return StrategyResult(scores)
 
     def _strategy_morpheme(self, keyword: str,
@@ -427,6 +458,9 @@ class StrategiesMixin:
         n_total = self._n_segments
         seed_set = set(seeds)
 
+        seed_seg_sorted = sorted(seed_segs)
+        local_window = max(n_total // 10, 50)
+
         scores: dict[str, float] = {}
         for w in vocab:
             if w in seed_set:
@@ -438,11 +472,43 @@ class StrategiesMixin:
             if observed < 2:
                 continue
             expected = n_seed * len(w_segs) / max(n_total, 1)
-            if expected < 0.5:
+
+            global_lift = (observed / max(expected, 0.01)
+                           if expected >= 0.5 else 0.0)
+
+            if global_lift > 1.0:
+                scores[w] = (global_lift - 1.0) * math.log2(observed + 1)
                 continue
-            lift = observed / max(expected, 0.01)
-            if lift <= 1.0:
+
+            # 全局 Lift 不足时，尝试局部窗口检测
+            if len(w_segs) < 3:
                 continue
-            scores[w] = (lift - 1.0) * math.log2(observed + 1)
+            w_seg_sorted = sorted(w_segs)
+            best_local_lift = 0.0
+            best_local_obs = 0
+            step = max(1, local_window // 2)
+            for win_start in range(0, n_total - local_window + 1, step):
+                win_end = win_start + local_window
+                local_seed = sum(1 for s in seed_seg_sorted
+                                 if win_start <= s < win_end)
+                local_w = sum(1 for s in w_seg_sorted
+                              if win_start <= s < win_end)
+                if local_seed < 2 or local_w < 2:
+                    continue
+                local_obs = sum(1 for s in w_seg_sorted
+                                if win_start <= s < win_end
+                                and s in seed_segs)
+                if local_obs < 2:
+                    continue
+                local_exp = local_seed * local_w / max(local_window, 1)
+                if local_exp > 0.5:
+                    ll = local_obs / local_exp
+                    if ll > best_local_lift:
+                        best_local_lift = ll
+                        best_local_obs = local_obs
+
+            if best_local_lift > 2.0:
+                scores[w] = ((best_local_lift - 1.0)
+                             * math.log2(best_local_obs + 1) * 0.7)
 
         return StrategyResult(scores)

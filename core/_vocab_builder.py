@@ -1,14 +1,25 @@
 """
-阶段一：全文词汇发现
+阶段一：全文词汇发现（两步法：PMI+自由度 过滤 → Trie 分词 → 干净频数）
 
 VocabBuilderMixin 提供：
   build_index           — 扫描全文，构建词频表、邻字表、词表、段落索引
   _build_segment_index  — 构建段落级词分布索引（供共主题策略使用）
-  _cohesion             — 计算词的凝固度（PMI 变体）
+  _cohesion             — 计算词的凝固度（log-PMI，对词长天然归一化）
   _filter_extensions    — 清洗伪合成词（散字粘连 / 短语拼合）
   _find_all             — 在全文中找子串所有出现位置
   _vocab_after          — 从指定位置向后匹配词表词
   _vocab_before         — 从指定位置向前匹配词表词
+
+核心改进（参考 bojone/word-discovery）：
+  传统单步法直接对所有子串计频，高频长词（如"张无忌"）会污染子串
+  （如"张无""无忌"）的频数和邻字分布。两步法：
+    Pass 1  原始 n-gram 统计，同时收集邻字。
+            用 PMI（凝固度）+ 自由度（信息熵）双重过滤出"结实"的 n-gram。
+            "物系魂兽"右边永远跟着固定字 → 自由度≈0 → 淘汰。
+            "灭绝师"右边永远是"太" → 自由度≈0 → 淘汰。
+    Pass 2  用 Trie 长词优先分词对原文切分，从切分结果统计干净频数。
+            "植物系魂兽"被整体切走 → "物系魂兽"独立出现次数归零 → 出局。
+            "植物系"和"魂兽"在别处也出现 → 保持健康频数 → 留存。
 
 所有阈值参数通过 TermExtractor 的类常量读取（self.VOCAB_COH_STRICT 等），
 不在本文件中硬编码。
@@ -18,63 +29,180 @@ import math
 from collections import Counter, defaultdict
 from typing import DefaultDict
 
-from ._utils import _RE_CHINESE, _entropy, _clean_boundary, _LONG_PHRASE_INTERIOR
+from ._utils import (
+    _RE_CHINESE, _entropy, _clean_boundary,
+    _LONG_PHRASE_INTERIOR, _DIALOGUE_TRAIL,
+)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Trie 树 + 正向最长匹配
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class _SimpleTrie:
+    """Trie 树，正向最长匹配分词（长词优先）。"""
+
+    def __init__(self):
+        self._root: dict = {}
+        self._END = True
+
+    def add_word(self, word: str):
+        node = self._root
+        for c in word:
+            node = node.setdefault(c, {})
+        node[self._END] = True
+
+    def tokenize(self, text: str) -> list[str]:
+        """正向最长匹配：每次从当前位置起取最长能匹配的词。"""
+        result: list[str] = []
+        i = 0
+        n = len(text)
+        while i < n:
+            node = self._root
+            last_end = i + 1          # 默认：单字
+            j = i
+            while j < n and text[j] in node:
+                node = node[text[j]]
+                j += 1
+                if self._END in node:
+                    last_end = j      # 记住最长匹配
+            result.append(text[i:last_end])
+            i = last_end
+        return result
 
 
 class VocabBuilderMixin:
 
     # ------------------------------------------------------------------ #
-    # 阶段一：构建词表                                                       #
+    # 阶段一：构建词表（两步法）                                               #
     # ------------------------------------------------------------------ #
 
     def build_index(self, text: str):
         self._text = text
         self._text_len = len(text)
 
-        freq: Counter = Counter()
+        # ── Pass 1：原始 n-gram 统计 + 邻字收集 ──
+        raw_freq: Counter = Counter()
+        raw_left: defaultdict = defaultdict(Counter)
+        raw_right: defaultdict = defaultdict(Counter)
+        total_chars = 0
+
+        for m in _RE_CHINESE.finditer(text):
+            seq = m.group()
+            n = len(seq)
+            total_chars += n
+            for ch in seq:
+                raw_freq[ch] += 1
+            for i in range(n):
+                for length in range(self.min_len,
+                                    min(self.max_len + 1, n - i + 1)):
+                    w = seq[i:i + length]
+                    raw_freq[w] += 1
+                    if i > 0:
+                        raw_left[w][seq[i - 1]] += 1
+                    if i + length < n:
+                        raw_right[w][seq[i + length]] += 1
+
+        self._freq = raw_freq
+        self._total_chars = total_chars
+
+        # ── PMI + 自由度 双重过滤 → 结实 n-gram 集 ──
+        # "手持倚"右边永远是"天" → 自由度=0 → 不进 Trie
+        # "灭绝师"右边永远是"太" → 自由度=0 → 不进 Trie
+        solid: set[str] = set()
+        pmi_values: dict[str, float] = {}
+        solid_base = self.SOLID_PMI_MIN
+        solid_free = self.SOLID_FREE_MIN
+
+        candidates = [
+            (w, f) for w, f in raw_freq.items()
+            if f >= 2 and len(w) >= self.min_len
+        ]
+        candidates.sort(key=lambda x: len(x[0]))
+
+        for w, f in candidates:
+            wlen = len(w)
+            if not _clean_boundary(w):
+                continue
+            if wlen >= 4 and any(c in _LONG_PHRASE_INTERIOR
+                                for c in w[1:-1]):
+                continue
+
+            # 凝固度（log-PMI）
+            coh = self._cohesion(w)
+            solid_threshold = solid_base + max(wlen - 2, 0)
+            if coh < solid_threshold:
+                continue
+
+            # 自由度预过滤：如果两侧都有邻字观测，则要求两侧都有起码的多样性
+            left_cnt = sum(raw_left[w].values())
+            right_cnt = sum(raw_right[w].values())
+            if left_cnt > 0 and right_cnt > 0:
+                raw_freedom = min(_entropy(raw_left[w]),
+                                  _entropy(raw_right[w]))
+                if raw_freedom < solid_free:
+                    continue
+
+            # 名字+对白动词不应作为分词单元
+            if wlen >= 3 and w[-1] in _DIALOGUE_TRAIL:
+                prefix = w[:-1]
+                if len(prefix) >= self.min_len and prefix in solid:
+                    continue
+
+            solid.add(w)
+            pmi_values[w] = coh
+
+        # ── Trie 长词优先分词 → 干净频数 ──
+        trie = _SimpleTrie()
+        for w in solid:
+            trie.add_word(w)
+
+        clean_freq: Counter = Counter()
         left_nb: defaultdict = defaultdict(Counter)
         right_nb: defaultdict = defaultdict(Counter)
 
         for m in _RE_CHINESE.finditer(text):
             seq = m.group()
-            n = len(seq)
-            # 单字频率必须单独统计，否则凝固度分母默认为 1，
-            # 导致"名字+泛用字"凝固度虚高而混入词表
-            for ch in seq:
-                freq[ch] += 1
-            for i in range(n):
-                for length in range(self.min_len,
-                                    min(self.max_len + 1, n - i + 1)):
-                    w = seq[i:i + length]
-                    freq[w] += 1
-                    if i > 0:
-                        left_nb[w][seq[i - 1]] += 1
-                    if i + length < n:
-                        right_nb[w][seq[i + length]] += 1
+            slen = len(seq)
+            tokens = trie.tokenize(seq)
+            pos = 0
+            for tok in tokens:
+                tlen = len(tok)
+                if tlen >= self.min_len:
+                    clean_freq[tok] += 1
+                    if pos > 0:
+                        left_nb[tok][seq[pos - 1]] += 1
+                    if pos + tlen < slen:
+                        right_nb[tok][seq[pos + tlen]] += 1
+                pos += tlen
 
-        self._freq = freq
         self._left_nb = left_nb
         self._right_nb = right_nb
 
+        # ── 构建词表 ──
         coh_strict = self.VOCAB_COH_STRICT
         free_strict = self.VOCAB_FREE_STRICT
         coh_relaxed = self.VOCAB_COH_RELAXED
         free_relaxed = self.VOCAB_FREE_RELAXED
+        coh_rescue = coh_strict + 2.0
 
         vocab: dict = {}
         vocab_relaxed: dict = {}
-        for w, f in freq.items():
-            if f < 2 or len(w) < self.min_len:
+
+        for w in solid:
+            f = clean_freq.get(w, 0)
+            if f < 2:
                 continue
-            wlen = len(w)
-            if wlen >= 6 and any(c in _LONG_PHRASE_INTERIOR for c in w[1:-1]):
+            coh = pmi_values[w]
+            if coh < coh_relaxed:
                 continue
-            # 长词切分点多，更容易被高频子串拉低凝固度，按长度放宽门槛
-            len_discount = 2.0 / max(wlen, 2)
-            coh = self._cohesion(w)
-            if coh < coh_relaxed * len_discount:
-                continue
+
             freedom = min(_entropy(left_nb[w]), _entropy(right_nb[w]))
+
+            if (len(w) >= 3 and w[-1] in _DIALOGUE_TRAIL
+                    and w[:-1] in solid and freedom < free_strict):
+                continue
+
             entry = {
                 'freq': f,
                 'cohesion': round(coh, 4),
@@ -82,20 +210,18 @@ class VocabBuilderMixin:
             }
             if freedom >= free_relaxed:
                 vocab_relaxed[w] = entry
-            # 标准路径：凝固度和自由度都达标
-            if (coh >= coh_strict * len_discount
+            if (coh >= coh_strict
                     and freedom >= free_strict):
                 vocab[w] = entry
-            # 救回路径：单项大幅超标可补偿另一项
-            elif (coh >= coh_strict * len_discount * 2
+            elif (coh >= coh_rescue
                   and freedom >= free_relaxed):
                 vocab[w] = entry
             elif (freedom >= free_strict * 2
-                  and coh >= coh_relaxed * len_discount):
+                  and coh >= coh_relaxed):
                 vocab[w] = entry
 
-        self._filter_extensions(vocab, freq)
-        self._filter_extensions(vocab_relaxed, freq, lenient=True)
+        self._filter_extensions(vocab, raw_freq)
+        self._filter_extensions(vocab_relaxed, raw_freq, lenient=True)
         self._vocab = vocab
         self._vocab_relaxed = vocab_relaxed
         self._find_cache: dict[str, list[int]] = {}
@@ -120,10 +246,7 @@ class VocabBuilderMixin:
     _SEG_SIZE = 500
 
     def _build_segment_index(self, vocab: dict):
-        """扫描全文，记录每个词表词出现在哪些段落片段中。
-
-        按固定 _SEG_SIZE 字符切段，每段大致对应一个自然段/场景。
-        """
+        """扫描全文，记录每个词表词出现在哪些段落片段中。"""
         text = self._text
         seg_size = self._SEG_SIZE
         n_segs = max(1, (self._text_len + seg_size - 1) // seg_size)
@@ -146,28 +269,36 @@ class VocabBuilderMixin:
         self._n_segments: int = n_segs
 
     def _cohesion(self, word: str) -> float:
-        """词的凝固度：所有切分点上 PMI 的最小值"""
+        """词的凝固度：所有切分点上 log-PMI 的最小值。
+
+        log-PMI = log(N · freq(word) / (freq(L) · freq(R)))
+        对词长天然归一化（随机基线 ≈ 0），无需长度折扣。
+        """
         f = self._freq.get(word, 0)
         if f == 0 or len(word) < 2:
             return 0.0
+        total = self._total_chars
         worst = float('inf')
         for i in range(1, len(word)):
             lf = self._freq.get(word[:i], 1)
             rf = self._freq.get(word[i:], 1)
-            worst = min(worst, f / math.sqrt(lf * rf))
+            pmi = math.log(total * f / max(lf * rf, 1))
+            worst = min(worst, pmi)
         return worst
 
     def _filter_extensions(self, vocab: dict, freq: Counter,
                            lenient: bool = False):
         """清洗"伪合成词"：散字粘连 / 短语拼合。
 
-        阈值从类常量 FILTER_COH_* / FILTER_DOM_* 读取。
-        边界熵保护：如果词的自由度足够高，说明它被当作独立单元使用，
-        即使可拆分也保留。
+        边界 log-PMI：用词的干净频数作分子，原始子串频数作分母，
+        检验末字/首字是否真正属于该词。
         """
-        coh_threshold = self.FILTER_COH_LENIENT if lenient else self.FILTER_COH_STRICT
-        dom_threshold = self.FILTER_DOM_LENIENT if lenient else self.FILTER_DOM_STRICT
+        coh_threshold = (self.FILTER_COH_LENIENT if lenient
+                         else self.FILTER_COH_STRICT)
+        dom_threshold = (self.FILTER_DOM_LENIENT if lenient
+                         else self.FILTER_DOM_STRICT)
         free_protect = self.VOCAB_FREE_STRICT
+        total = self._total_chars
 
         to_remove: set = set()
         for w in list(vocab):
@@ -181,8 +312,9 @@ class VocabBuilderMixin:
             if prefix in vocab:
                 pair = w[-2:]
                 if pair not in vocab:
-                    coh = f_w / math.sqrt(
-                        max(freq.get(prefix, 1) * freq.get(w[-1], 1), 1))
+                    lf = freq.get(prefix, 1)
+                    rf = freq.get(w[-1], 1)
+                    coh = math.log(total * f_w / max(lf * rf, 1))
                     if coh < coh_threshold:
                         to_remove.add(w)
                         continue
@@ -191,8 +323,9 @@ class VocabBuilderMixin:
             if suffix in vocab:
                 pair = w[:2]
                 if pair not in vocab:
-                    coh = f_w / math.sqrt(
-                        max(freq.get(w[0], 1) * freq.get(suffix, 1), 1))
+                    lf = freq.get(w[0], 1)
+                    rf = freq.get(suffix, 1)
+                    coh = math.log(total * f_w / max(lf * rf, 1))
                     if coh < coh_threshold:
                         to_remove.add(w)
                         continue
