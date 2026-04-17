@@ -4,6 +4,17 @@ from core.text_cleaner import clean_text
 from core.term_extractor import TermExtractor, MODE_PRESETS
 from core.dict_filter import DictFilter
 
+# 类型标签中文化（与 core/_pattern_miner.py 的类型体系一致）
+_TYPE_ZH = {
+    'person':   '人物',
+    'place':    '地点',
+    'creature': '生物',
+    'skill':    '技·物',
+    'group':    '组织',
+    'misc':     '其他',
+    '':         '',
+}
+
 st.set_page_config(page_title="AIWA 文本调试台", layout="wide")
 st.title("AIWA 2.0 - 文本调试台")
 
@@ -283,12 +294,17 @@ if uploaded_file is not None:
                     for r in display_results:
                         flat_rows.append({
                             '词语': r['word'],
+                            '层': r.get('tier', ''),
+                            '类型': _TYPE_ZH.get(r.get('type', ''),
+                                                r.get('type', '')),
                             '词性': r.get('pos_group', ''),
                             '出现频次': r['freq'],
                             '综合评分': r['score'],
                             '命中策略': r['strategies'],
                             '命中数': r['hit_count'],
+                            '命中模板': r.get('templates', ''),
                             '匹配模式': r['matched_patterns'],
+                            '原文证据': r.get('evidence', ''),
                             '子术语': '、'.join(
                                 c['word'] for c in r.get('children', [])
                             ),
@@ -319,10 +335,16 @@ if uploaded_file is not None:
                                 child_df = pd.DataFrame([
                                     {
                                         '子术语': c['word'],
+                                        '层': c.get('tier', ''),
+                                        '类型': _TYPE_ZH.get(
+                                            c.get('type', ''),
+                                            c.get('type', '')),
                                         '词性': c.get('pos_group', ''),
                                         '出现频次': c['freq'],
                                         '综合评分': c['score'],
                                         '命中策略': c['strategies'],
+                                        '命中模板': c.get('templates', ''),
+                                        '原文证据': c.get('evidence', ''),
                                     }
                                     for c in children
                                 ])
@@ -347,12 +369,17 @@ if uploaded_file is not None:
                             st.dataframe(removed_df, use_container_width=True)
 
                     st.caption(
+                        "**层**：L1=统计主干（PMI+自由度通过），"
+                        "L2=模板孤岛（对白/命名/量词等高置信模板命中，含低频专名）　｜　"
+                        "**类型**：来自模板命中的粗分类，用于类型先验加权　｜　"
                         "**词性**：基于 jieba 词典标注，「未收录」通常是领域专有术语　｜　"
                         "**命中策略**：字符=字符包含、上下文=上下文模式引导、"
                         "共现=共现近邻、构词=构词结构相似、互替=上下文互替性、"
                         "共主题=段落级共现　｜　"
                         "**命中数**：被几种策略同时发现（越多越可信）　｜　"
-                        "**匹配模式**：命中的上下文模板　｜　"
+                        "**命中模板**：通道 B/C 的高精度模板 id　｜　"
+                        "**匹配模式**：上下文策略命中的特征　｜　"
+                        "**原文证据**：【】内为命中词，截取附近原文短句　｜　"
                         "**子术语**：包含该主词的更长术语（从属关系）"
                     )
         else:

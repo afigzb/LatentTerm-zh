@@ -14,6 +14,9 @@ from collections import Counter, defaultdict
 from ._utils import _normalize, _LEFT_NOISE, _RIGHT_NOISE
 from ._vocab_builder import VocabBuilderMixin
 from ._strategies import StrategiesMixin
+from ._pattern_miner import (
+    infer_keyword_type, format_evidence_snippets,
+)
 
 
 # ── 模式预设（UI 层和算法层共用）────────────────────────────────────────
@@ -76,6 +79,16 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
     CONTEXT_DECAY = 0.7
     HOP2_DECAY = 0.7
 
+    # 类型先验 & 模板同族（R5 / R6）
+    TYPE_MATCH_BONUS = 1.30          # 同类型乘子
+    TYPE_MISMATCH_PENALTY = 0.85     # 异类型乘子（两端都非 misc 才生效）
+    TEMPLATE_FAMILY_BONUS = 0.08     # 模板同族加分
+
+    # 高置信度模板集合（L2 命中这些模板可豁免 min_freq 门槛）
+    _HIGH_CONF_TEMPLATES = frozenset({
+        'B1.dialog', 'B2.named', 'B5.role',
+    })
+
     def __init__(self, min_len: int = 2, max_len: int = 8):
         self.min_len = min_len
         self.max_len = max_len
@@ -90,12 +103,71 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
         self._built: bool = False
 
     # ------------------------------------------------------------------ #
-    # 词表选择                                                              #
+    # 词表 / 候选池选择                                                      #
     # ------------------------------------------------------------------ #
 
     def _active_vocab(self, mode: str) -> dict:
-        """按模式返回对应词表，取代原先 extract() 中的临时替换。"""
-        return self._vocab_relaxed if mode == 'low_freq' else self._vocab
+        """所有模式统一返回 candidates（L1 + L2 模板命中）。
+
+        L1/L2 的分层靠 info['tier']；不同模式通过 min_freq 自然分化：
+          - high_freq  (min_freq >= 100) → L2 基本被过滤（除高置信模板）
+          - balanced   (min_freq 2~50)   → 混合展示
+          - low_freq   (min_freq 2~10)   → L2 主场
+        """
+        return self._candidates
+
+    # ------------------------------------------------------------------ #
+    # 通道 C：关键词自适应模板（extract 运行时扩充候选池）                        #
+    # ------------------------------------------------------------------ #
+
+    def _channel_c_expand(self, keyword: str) -> dict:
+        """用关键词上下文指纹从原文反向挖掘候选，不污染 self._candidates。"""
+        positions = self._find_all(keyword)
+        if not positions or not hasattr(self, '_pattern_miner'):
+            return {}
+        # 把已有 L1/L2 候选作为对齐字典，消除"只听张无忌"→"张无忌"
+        known_vocab = set(self._candidates.keys())
+        c_hits = self._pattern_miner.channel_c(
+            keyword, self._text, positions, known_vocab=known_vocab)
+        extra: dict = {}
+        for w, meta in c_hits.items():
+            if w in self._candidates:
+                # 已在池 → 补充证据/模板回写（只影响本次返回的 info）
+                base = dict(self._candidates[w])
+                base['templates'] = set(base.get('templates') or set()) \
+                    | set(meta['templates'])
+                base['origins'] = set(base.get('origins') or set()) \
+                    | set(meta['origins'])
+                if not base.get('type'):
+                    base['type'] = meta['type']
+                budget = 5 - len(base.get('evidence') or [])
+                if budget > 0:
+                    base['evidence'] = (base.get('evidence') or []) \
+                        + list(meta['evidence'][:budget])
+                extra[w] = base
+                continue
+            extra[w] = {
+                'freq': meta['freq'],
+                'tier': 'L2',
+                'origins': set(meta['origins']),
+                'templates': set(meta['templates']),
+                'type': meta['type'],
+                'evidence': list(meta['evidence'][:5]),
+                'cohesion': 0.0,
+                'freedom': 0.0,
+            }
+        return extra
+
+    # ------------------------------------------------------------------ #
+    # 关键词类型推断                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _keyword_type(self, keyword: str, vocab: dict) -> str | None:
+        """优先从候选池查；没查到再用提示词映射。"""
+        info = vocab.get(keyword)
+        if info and info.get('type') and info['type'] != 'misc':
+            return info['type']
+        return infer_keyword_type(keyword)
 
     # ------------------------------------------------------------------ #
     # 阶段三：多信号融合排序                                                  #
@@ -109,7 +181,14 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
         if not self._built:
             raise RuntimeError('请先调用 build_index(text)')
 
-        vocab = self._active_vocab(mode)
+        # ── 运行时候选池 = 持久候选 + 通道 C 扩充 ──
+        base_vocab = self._active_vocab(mode)
+        extra = self._channel_c_expand(keyword)
+        if extra:
+            vocab = {**base_vocab, **extra}
+        else:
+            vocab = base_vocab
+
         raw_scores, pattern_info = self._run_strategies(keyword, mode, vocab)
 
         n_char = _normalize(raw_scores['char_overlap'])
@@ -121,13 +200,18 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
         all_words = (set(n_char) | set(n_context) | set(n_cooccur)
                      | set(n_morph) | set(n_subst) | set(n_topic))
 
+        # R5/R6 所需的关键词类型与模板集合
+        kw_type = self._keyword_type(keyword, vocab)
+        kw_info = vocab.get(keyword) or {}
+        kw_templates = set(kw_info.get('templates') or set())
+
         miss = -0.03 if mode == 'low_freq' else self.MISS_PENALTY
         results = []
         for word in all_words:
             info = vocab.get(word)
-            if not info or info['freq'] < min_freq:
+            if not info:
                 continue
-            if max_freq > 0 and info['freq'] > max_freq:
+            if not self._passes_freq_gate(info, min_freq, max_freq):
                 continue
 
             s_char = n_char.get(word, miss)
@@ -144,6 +228,20 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
                                    s_morph, s_subst, s_topic) if s > 0)
             score += self.CROSS_BONUS * max(0, hits - 1)
 
+            # R5 类型先验
+            w_type = info.get('type')
+            if (kw_type and w_type and w_type != 'misc'
+                    and kw_type != 'misc'):
+                if w_type == kw_type:
+                    score *= self.TYPE_MATCH_BONUS
+                else:
+                    score *= self.TYPE_MISMATCH_PENALTY
+
+            # R6 模板同族
+            w_templates = set(info.get('templates') or set())
+            if kw_templates and (kw_templates & w_templates):
+                score += self.TEMPLATE_FAMILY_BONUS
+
             labels = []
             if s_char > 0:
                 labels.append('字符')
@@ -158,6 +256,12 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
             if s_topic > 0:
                 labels.append('共主题')
 
+            evidence_snips = []
+            ev = info.get('evidence') or []
+            if ev:
+                evidence_snips = format_evidence_snippets(
+                    self._text, ev, word, max_count=2)
+
             results.append({
                 'word': word,
                 'freq': info['freq'],
@@ -166,6 +270,11 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
                 'hit_count': hits,
                 'matched_patterns': '  '.join(
                     pattern_info.get(word, [])),
+                'tier': info.get('tier', 'L1'),
+                'type': info.get('type') or '',
+                'templates': '、'.join(
+                    sorted(info.get('templates') or set())),
+                'evidence': '  ∥  '.join(evidence_snips),
             })
 
         results.sort(key=lambda x: x['score'], reverse=True)
@@ -175,6 +284,11 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
         if kw_freq is None:
             kw_freq = self._text.count(keyword)
         if kw_freq > 0:
+            # 命中词本身的证据（若有）
+            kw_ev_snips = []
+            if kw_info.get('evidence'):
+                kw_ev_snips = format_evidence_snippets(
+                    self._text, kw_info['evidence'], keyword, max_count=2)
             kw_entry = {
                 'word': keyword,
                 'freq': kw_freq,
@@ -182,10 +296,36 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
                 'strategies': '用户输入',
                 'hit_count': 6,
                 'matched_patterns': '',
+                'tier': kw_info.get('tier', 'L1'),
+                'type': kw_info.get('type') or (kw_type or ''),
+                'templates': '、'.join(
+                    sorted(kw_info.get('templates') or set())),
+                'evidence': '  ∥  '.join(kw_ev_snips),
             }
             results = [kw_entry] + results
 
         return self._group_by_parent(results)
+
+    # ------------------------------------------------------------------ #
+    # 频率门槛：L2 + 高置信模板可豁免 min_freq                                  #
+    # ------------------------------------------------------------------ #
+
+    def _passes_freq_gate(self, info: dict,
+                          min_freq: int, max_freq: int) -> bool:
+        freq = info['freq']
+        tier = info.get('tier', 'L1')
+        templates = info.get('templates') or set()
+
+        if max_freq > 0 and freq > max_freq:
+            return False
+
+        if freq >= min_freq:
+            return True
+
+        # L2 + 高置信模板 → 豁免 min_freq 下限
+        if tier == 'L2' and (templates & self._HIGH_CONF_TEMPLATES):
+            return True
+        return False
 
     # ------------------------------------------------------------------ #
     # 策略调度：根据模式决定策略执行流程                                          #

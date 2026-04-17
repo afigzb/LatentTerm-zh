@@ -33,6 +33,7 @@ from ._utils import (
     _RE_CHINESE, _entropy, _clean_boundary,
     _LONG_PHRASE_INTERIOR, _DIALOGUE_TRAIL,
 )
+from ._pattern_miner import PatternMiner, can_decompose_by_l1
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -226,9 +227,19 @@ class VocabBuilderMixin:
         self._vocab_relaxed = vocab_relaxed
         self._find_cache: dict[str, list[int]] = {}
 
+        # ── 通道 B：模板狙击，产出 L2 候选池 ──
+        miner = PatternMiner(min_len=self.min_len, max_len=self.max_len)
+        pattern_hits = miner.mine(text)
+
+        # ── 合并 L1 (vocab_relaxed) + L2 (pattern_hits) → candidates ──
+        self._candidates = self._merge_candidates(
+            vocab_relaxed, pattern_hits, raw_freq)
+        self._pattern_miner = miner
+
+        # ── 索引基于候选池重建（L1 + L2 都能被字符/构词策略发现）──
         char_idx: DefaultDict[str, set[str]] = defaultdict(set)
         bigram_idx: DefaultDict[str, set[str]] = defaultdict(set)
-        for w in vocab:
+        for w in self._candidates:
             for ch in set(w):
                 char_idx[ch].add(w)
             for i in range(len(w) - 1):
@@ -236,8 +247,80 @@ class VocabBuilderMixin:
         self._char_index = dict(char_idx)
         self._bigram_index = dict(bigram_idx)
 
-        self._build_segment_index(vocab_relaxed)
+        self._build_segment_index(self._candidates)
         self._built = True
+
+    # ------------------------------------------------------------------ #
+    # 候选池合并：L1 (统计通道) + L2 (模板通道)                                #
+    # ------------------------------------------------------------------ #
+
+    def _merge_candidates(self, vocab_relaxed: dict,
+                          pattern_hits: dict,
+                          raw_freq: Counter) -> dict:
+        """把统计词表和模板命中合并成统一候选池。
+
+        每个候选的字段：
+          freq       — 频数（L1 用 clean_freq，L2 用正则命中数或 raw_freq）
+          tier       — 'L1' / 'L2'
+          origins    — {'A'} / {'B1', 'B2', ...} / {'A', 'B1', ...}
+          templates  — 命中模板 id 集合
+          type       — person/place/creature/skill/group/misc/None
+          evidence   — [(pos, tmpl_id), ...]
+          cohesion   — L1 有，L2 为 0.0
+          freedom    — L1 有，L2 为 0.0
+        """
+        candidates: dict = {}
+
+        # L1 先入池
+        for w, info in vocab_relaxed.items():
+            candidates[w] = {
+                'freq': info['freq'],
+                'tier': 'L1',
+                'origins': {'A'},
+                'templates': set(),
+                'type': None,
+                'evidence': [],
+                'cohesion': info['cohesion'],
+                'freedom': info['freedom'],
+            }
+
+        # L1 词集（供纯 L2 候选做"短语拼凑"反验）
+        l1_words = set(vocab_relaxed.keys())
+
+        # L2 合并
+        for w, meta in pattern_hits.items():
+            if w in candidates:
+                # 已在 L1 → 补类型 + 模板证据
+                entry = candidates[w]
+                entry['origins'].update(meta['origins'])
+                entry['templates'].update(meta['templates'])
+                if entry['type'] is None:
+                    entry['type'] = meta['type']
+                # 合并证据（截断）
+                budget = 5 - len(entry['evidence'])
+                if budget > 0:
+                    entry['evidence'].extend(meta['evidence'][:budget])
+            else:
+                # 纯 L2 候选 → L1 词表反验：能被完全切分 = 短语拼凑，丢弃
+                # （"真空地带" = "真空"+"地带"；"一尊强者" 已被前置规则挡掉）
+                if can_decompose_by_l1(w, l1_words):
+                    continue
+                rf = raw_freq.get(w, 0)
+                freq_guess = max(rf, meta['freq'])
+                if freq_guess < 1:
+                    continue
+                candidates[w] = {
+                    'freq': freq_guess,
+                    'tier': 'L2',
+                    'origins': set(meta['origins']),
+                    'templates': set(meta['templates']),
+                    'type': meta['type'],
+                    'evidence': list(meta['evidence'][:5]),
+                    'cohesion': 0.0,
+                    'freedom': 0.0,
+                }
+
+        return candidates
 
     # ------------------------------------------------------------------ #
     # 段落级索引（供共主题策略使用）                                            #
