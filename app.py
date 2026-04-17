@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from core.text_cleaner import clean_text
-from core.term_extractor import TermExtractor, MODE_PRESETS
+from core.term_extractor import TermExtractor, DEFAULT_CONFIG
 from core.dict_filter import DictFilter
 
 # 类型标签中文化（与 core/_pattern_miner.py 的类型体系一致）
@@ -139,39 +139,27 @@ if uploaded_file is not None:
     with tab_extract:
         st.subheader("关键词术语聚合")
 
-        mode = st.radio(
-            "提取模式",
-            list(MODE_PRESETS.keys()),
-            format_func=lambda k: MODE_PRESETS[k]['label'],
-            horizontal=True,
-            help="均衡＝通用｜高频＝只看常见词｜低频＝挖掘稀有词（两跳发散）",
-        )
-        cfg = MODE_PRESETS[mode]
-        st.caption(cfg['desc'])
+        cfg = DEFAULT_CONFIG
 
-        col_kw, col_freq, col_top = st.columns([2, 1, 1])
+        col_kw, col_min, col_max, col_top = st.columns([2, 1, 1, 1])
         with col_kw:
             keyword = st.text_input("关键词", placeholder="例：丹药、功法、剑诀")
-        with col_freq:
-            mn, mx = cfg['min_freq_range']
+        with col_min:
             min_freq = st.slider(
-                "最低出现频次", min_value=mn, max_value=mx,
-                value=cfg['min_freq'], key=f"min_freq_{mode}",
+                "最低出现频次", min_value=2, max_value=2000,
+                value=cfg['min_freq'], key="min_freq",
                 help="低于此频次的候选词直接过滤",
+            )
+        with col_max:
+            max_freq = st.number_input(
+                "最高出现频次", min_value=0, value=cfg['max_freq'], step=10,
+                key="max_freq",
+                help="0 = 不限；设为正数后可排除出现过多的通用高频词",
             )
         with col_top:
             top_n = st.slider(
                 "最多展示条数", min_value=10, max_value=10000,
-                value=cfg['top_n'], key=f"top_n_{mode}",
-            )
-
-        max_freq = 0
-        if mode == 'low_freq':
-            max_freq = st.slider(
-                "最高出现频次（排除高频词）",
-                min_value=10, max_value=500, value=cfg['max_freq'],
-                key="max_freq_low",
-                help="高于此频次的词不会出现在结果中",
+                value=cfg['top_n'], key="top_n",
             )
 
         with st.expander("策略权重调节", expanded=False):
@@ -179,33 +167,32 @@ if uploaded_file is not None:
             wr1, wr2, wr3 = st.columns(3)
             with wr1:
                 w_char = st.slider("字符包含", 0.0, 1.0, cfg['w_char'], 0.05,
-                                   key=f"w_char_{mode}")
+                                   key="w_char")
             with wr2:
                 w_context = st.slider("上下文模式", 0.0, 1.0, cfg['w_context'], 0.05,
-                                      key=f"w_context_{mode}")
+                                      key="w_context")
             with wr3:
                 w_cooccur = st.slider("共现近邻", 0.0, 1.0, cfg['w_cooccur'], 0.05,
-                                      key=f"w_cooccur_{mode}")
+                                      key="w_cooccur")
             wr4, wr5, wr6 = st.columns(3)
             with wr4:
                 w_morph = st.slider("构词结构", 0.0, 1.0, cfg['w_morph'], 0.05,
-                                    key=f"w_morph_{mode}")
+                                    key="w_morph")
             with wr5:
                 w_subst = st.slider("互替性", 0.0, 1.0, cfg['w_subst'], 0.05,
-                                    key=f"w_subst_{mode}")
+                                    key="w_subst")
             with wr6:
                 w_topic = st.slider("段落共主题", 0.0, 1.0, cfg['w_topic'], 0.05,
-                                    key=f"w_topic_{mode}")
+                                    key="w_topic")
 
         if keyword:
-            spinner_msg = f"正在以{cfg['label']}提取与「{keyword}」相关的术语……"
-            with st.spinner(spinner_msg):
+            with st.spinner(f"正在提取与「{keyword}」相关的术语……"):
                 results = extractor.extract(
                     keyword, top_n=top_n, min_freq=min_freq,
                     w_char=w_char, w_context=w_context,
                     w_cooccur=w_cooccur, w_morph=w_morph,
                     w_subst=w_subst, w_topic=w_topic,
-                    mode=mode, max_freq=max_freq,
+                    max_freq=max_freq,
                 )
 
             if not results:
