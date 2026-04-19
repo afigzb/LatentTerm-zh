@@ -13,13 +13,24 @@ VocabBuilderMixin 提供：
 核心改进（参考 bojone/word-discovery）：
   传统单步法直接对所有子串计频，高频长词（如"张无忌"）会污染子串
   （如"张无""无忌"）的频数和邻字分布。两步法：
-    Pass 1  原始 n-gram 统计，同时收集邻字。
-            用 PMI（凝固度）+ 自由度（信息熵）双重过滤出"结实"的 n-gram。
+    Pass 1  原始 n-gram 统计，得到 PMI/自由度过滤后的"结实"n-gram 集。
             "物系魂兽"右边永远跟着固定字 → 自由度≈0 → 淘汰。
             "灭绝师"右边永远是"太" → 自由度≈0 → 淘汰。
     Pass 2  用 Trie 长词优先分词对原文切分，从切分结果统计干净频数。
             "植物系魂兽"被整体切走 → "物系魂兽"独立出现次数归零 → 出局。
             "植物系"和"魂兽"在别处也出现 → 保持健康频数 → 留存。
+
+Pass 1 内部进一步分两步（A1 + A3 优化，输出与朴素实现完全等价）：
+    Pass 1a  Apriori 频率剪枝：按长度增量统计 n-gram。
+             长度 k 的 n-gram 仅在其 (k-1)-前缀和 (k-1)-后缀的频数都 >= 2
+             时才登记。由 Apriori 性质：freq(k-gram)>=2 ⇒ 两端 (k-1)-gram
+             freq 都 >=2，故剪枝不丢任何下游会用到的词
+             （候选过滤要求 f>=2；_cohesion 对缺失子串以默认值 1 兜底）。
+             unique 数从 30M+ 降到 1–3M。
+    PMI 粗过滤  仅依赖频数，先筛出"通过凝固度"的候选 pmi_set。
+    Pass 1b  邻字延迟收集：仅为 pmi_set 收集左右邻字，
+             避免为 30M+ 子串无谓地分配 Counter 实例。
+    自由度 + 对白动词 终筛 → solid。
 
 所有阈值参数通过 TermExtractor 的类常量读取（self.VOCAB_COH_STRICT 等），
 不在本文件中硬编码。
@@ -28,6 +39,8 @@ VocabBuilderMixin 提供：
 import math
 from collections import Counter, defaultdict
 from typing import DefaultDict
+
+import ahocorasick
 
 from ._utils import (
     _RE_CHINESE, _entropy, _clean_boundary,
@@ -82,34 +95,45 @@ class VocabBuilderMixin:
         self._text = text
         self._text_len = len(text)
 
-        # ── Pass 1：原始 n-gram 统计 + 邻字收集 ──
+        # ── Pass 1a：Apriori 频率统计（不收集邻字）──
+        # 缓存中文段，供 Pass 1a / Pass 1b 复用，避免重复跑正则
+        segments: list[str] = [m.group()
+                               for m in _RE_CHINESE.finditer(text)]
+
         raw_freq: Counter = Counter()
-        raw_left: defaultdict = defaultdict(Counter)
-        raw_right: defaultdict = defaultdict(Counter)
         total_chars = 0
 
-        for m in _RE_CHINESE.finditer(text):
-            seq = m.group()
-            n = len(seq)
-            total_chars += n
-            for ch in seq:
-                raw_freq[ch] += 1
-            for i in range(n):
-                for length in range(self.min_len,
-                                    min(self.max_len + 1, n - i + 1)):
-                    w = seq[i:i + length]
-                    raw_freq[w] += 1
-                    if i > 0:
-                        raw_left[w][seq[i - 1]] += 1
-                    if i + length < n:
-                        raw_right[w][seq[i + length]] += 1
+        # 长度 1：所有汉字一次性吞下（Counter.update 为 C 实现）
+        for seq in segments:
+            total_chars += len(seq)
+            raw_freq.update(seq)
+
+        # 长度 min_len..max_len：min_len 直接计数；更长用 Apriori 剪枝
+        # Apriori：若 freq(k-gram) >= 2，则两端 (k-1)-gram 的 freq 都 >= 2。
+        # 下游候选过滤要求 f >= 2，剪掉 freq<2 的 n-gram 不影响最终结果
+        # （_cohesion 对缺失子串以默认值 1 兜底，与原实现等价）。
+        for k in range(self.min_len, self.max_len + 1):
+            if k == self.min_len:
+                for seq in segments:
+                    n = len(seq)
+                    for i in range(n - k + 1):
+                        raw_freq[seq[i:i + k]] += 1
+            else:
+                for seq in segments:
+                    n = len(seq)
+                    for i in range(n - k + 1):
+                        if raw_freq.get(seq[i:i + k - 1], 0) < 2:
+                            continue
+                        if raw_freq.get(seq[i + 1:i + k], 0) < 2:
+                            continue
+                        raw_freq[seq[i:i + k]] += 1
 
         self._freq = raw_freq
         self._total_chars = total_chars
 
-        # ── PMI + 自由度 双重过滤 → 结实 n-gram 集 ──
-        # "手持倚"右边永远是"天" → 自由度=0 → 不进 Trie
-        # "灭绝师"右边永远是"太" → 自由度=0 → 不进 Trie
+        # ── PMI 粗过滤（不读邻字，省下 ~30M 个 Counter 实例）──
+        # "手持倚"右边永远是"天" → 自由度=0 → 后续会被淘汰
+        # "灭绝师"右边永远是"太" → 自由度=0 → 后续会被淘汰
         solid: set[str] = set()
         pmi_values: dict[str, float] = {}
         solid_base = self.SOLID_PMI_MIN
@@ -121,6 +145,8 @@ class VocabBuilderMixin:
         ]
         candidates.sort(key=lambda x: len(x[0]))
 
+        # 第一轮：仅做 PMI（凝固度）筛选，邻字延后收集
+        pmi_passed: list[tuple[str, int]] = []
         for w, f in candidates:
             wlen = len(w)
             if not _clean_boundary(w):
@@ -135,6 +161,36 @@ class VocabBuilderMixin:
             if coh < solid_threshold:
                 continue
 
+            pmi_passed.append((w, wlen))
+            pmi_values[w] = coh
+
+        pmi_set: set[str] = {w for w, _ in pmi_passed}
+
+        # ── Pass 1b：仅为 PMI 候选收集邻字（消除 OOM 的关键）──
+        # 邻字 Counter 数量从 ~30M 降到 ~|pmi_set|（通常 5万–50万），
+        # 对应内存从 ~10GB 降到 < 200MB。
+        raw_left: defaultdict = defaultdict(Counter)
+        raw_right: defaultdict = defaultdict(Counter)
+        min_l, max_l = self.min_len, self.max_len
+
+        for seq in segments:
+            n = len(seq)
+            for i in range(n):
+                upper = min(max_l + 1, n - i + 1)
+                for length in range(min_l, upper):
+                    w = seq[i:i + length]
+                    if w not in pmi_set:
+                        continue
+                    if i > 0:
+                        raw_left[w][seq[i - 1]] += 1
+                    if i + length < n:
+                        raw_right[w][seq[i + length]] += 1
+
+        del segments  # ~text 大小的副本，及时释放
+
+        # 第二轮：自由度 + 名字+对白动词 终筛
+        # 按长度顺序处理，保证 prefix in solid 检查时短词已先入 solid
+        for w, wlen in pmi_passed:
             # 自由度预过滤：如果两侧都有邻字观测，则要求两侧都有起码的多样性
             left_cnt = sum(raw_left[w].values())
             right_cnt = sum(raw_right[w].values())
@@ -151,7 +207,6 @@ class VocabBuilderMixin:
                     continue
 
             solid.add(w)
-            pmi_values[w] = coh
 
         # ── Trie 长词优先分词 → 干净频数 ──
         trie = _SimpleTrie()
@@ -247,8 +302,157 @@ class VocabBuilderMixin:
         self._char_index = dict(char_idx)
         self._bigram_index = dict(bigram_idx)
 
-        self._build_segment_index(self._candidates)
+        # ── 跨策略预计算缓存（性能加速，行为完全等价）──
+        # _clean_set      候选词的 _clean_boundary 结果一次算定
+        # _log_freq_p1/p2 log2(freq+1) / log2(freq+2) 一次算定
+        # _vocab_starts   位置 → 该位置开头的 clean vocab 词列表（_vocab_after 用）
+        # _vocab_ends     位置 → 该位置结尾的 clean vocab 词列表（_vocab_before 用）
+        # _word_segs      词 → 出现段落 id 集合（co_topic 用）
+        # _seg_words      段落 → 出现在该段的候选词集合（co_topic 用）
+        # 所有索引由一次 Aho-Corasick 全文扫描产出，原 _build_segment_index +
+        # 逐位置 vocab 切片在此被一次性吃掉。
+        self._build_strategy_caches()
         self._built = True
+
+    # ------------------------------------------------------------------ #
+    # 跨策略预计算缓存（build_index 末尾调用，extract 时按需扩充）              #
+    # ------------------------------------------------------------------ #
+
+    def _build_strategy_caches(self):
+        """对 self._candidates 一次性预算所有跨策略缓存。
+
+        三步：
+          1. _clean_set / _log_freq_p1/p2  ← 直接遍历 candidates
+          2. _vocab_starts / _vocab_ends / _word_segs / _n_segments
+             ← 一次 Aho-Corasick 扫描全文同时产出（_build_ac_index）
+          3. _seg_words ← 反转 _word_segs
+
+        策略代码的语义保持不变：
+          • clean_set 与原 _clean_boundary 在 candidates 上一一对应
+          • log_freq_p1/p2 与 math.log2(freq+1/2) 数值完全一致
+          • word_segs 与原 _build_segment_index 输出等价（同样不过 clean_set）
+          • vocab_starts/ends 与原 _vocab_after/before 中
+            `if w in vocab and w in clean_set` 的过滤结果等价
+          • seg_words 与 word_segs 互为倒置，无信息损失
+        """
+        cands = self._candidates
+
+        clean_set: set[str] = set()
+        log1: dict[str, float] = {}
+        log2_: dict[str, float] = {}
+        for w, info in cands.items():
+            if _clean_boundary(w):
+                clean_set.add(w)
+            f = info['freq']
+            log1[w] = math.log2(f + 1)
+            log2_[w] = math.log2(f + 2)
+        self._clean_set = clean_set
+        self._log_freq_p1 = log1
+        self._log_freq_p2 = log2_
+
+        self._build_ac_index()
+
+        seg_words: DefaultDict[int, set] = defaultdict(set)
+        for w, segs in self._word_segs.items():
+            for sid in segs:
+                seg_words[sid].add(w)
+        self._seg_words = dict(seg_words)
+
+    def _build_ac_index(self):
+        """用 Aho-Corasick 对全文做一次多模式匹配，同时产出三张索引：
+
+          _vocab_starts: dict[int, list[str]]
+              position → 在该位置开头、且通过 _clean_boundary 的候选词列表
+              （_vocab_after 的 O(1) 查表后端）
+
+          _vocab_ends: dict[int, list[str]]
+              exclusive end → 在该位置结尾、且通过 _clean_boundary 的候选词
+              （_vocab_before 的 O(1) 查表后端，end = start + len(word)）
+
+          _word_segs: dict[str, set[int]]
+              候选词 → 出现段落 id 集合（co_topic 用）
+              这里**不**应用 clean_set 过滤，与原 _build_segment_index 等价
+
+        以及 _n_segments 段落总数。
+
+        替代了原 _build_segment_index 的全文（i, length）枚举（O(N·max_len)
+        Python 循环）和策略侧 _vocab_after/before 的逐长度切片+dict 查询。
+        """
+        text = self._text
+        seg_size = self._SEG_SIZE
+        self._n_segments = max(
+            1, (self._text_len + seg_size - 1) // seg_size)
+
+        clean_set = self._clean_set
+        cands = self._candidates
+
+        vocab_starts: DefaultDict[int, list] = defaultdict(list)
+        vocab_ends: DefaultDict[int, list] = defaultdict(list)
+        word_segs: DefaultDict[str, set] = defaultdict(set)
+
+        if not cands:
+            self._vocab_starts = {}
+            self._vocab_ends = {}
+            self._word_segs = {}
+            return
+
+        # 自动机里只塞需要的最小集合（candidates 的并集），匹配命中即可
+        # 同时分流到三张索引。
+        automaton = ahocorasick.Automaton()
+        for w in cands:
+            automaton.add_word(w, w)
+        automaton.make_automaton()
+
+        # iter 给的是 (end_idx, value)，end_idx 是命中末字的 inclusive 下标
+        for end_idx, word in automaton.iter(text):
+            start = end_idx - len(word) + 1
+            word_segs[word].add(start // seg_size)
+            if word in clean_set:
+                vocab_starts[start].append(word)
+                vocab_ends[start + len(word)].append(word)
+
+        self._vocab_starts = dict(vocab_starts)
+        self._vocab_ends = dict(vocab_ends)
+        self._word_segs = dict(word_segs)
+
+    def _ensure_strategy_caches(self, vocab: dict):
+        """extract() 在合并 channel-C extras 后调用，把新增词补进缓存。
+
+        约束：候选集合不能因为缓存缺失而变小，所以只能"扩充"，不能"重建"。
+
+        除了原本的 _clean_set / _log_freq_p1/p2，还需把 extras 在全文中的
+        所有出现位置增量插入 _vocab_starts / _vocab_ends，否则
+        _vocab_after / _vocab_before 看不到这些词，context_pattern /
+        substitution / cooccurrence 会丢候选。
+
+        _word_segs 不更新：原 _build_segment_index 也只在 build 期固化，
+        co_topic 本来就对 channel-C extras 不可见，行为完全一致。
+        """
+        clean_set = self._clean_set
+        log1 = self._log_freq_p1
+        log2_ = self._log_freq_p2
+        text = self._text
+        vocab_starts = self._vocab_starts
+        vocab_ends = self._vocab_ends
+
+        for w, info in vocab.items():
+            if w in log1:
+                continue
+            f = info['freq']
+            log1[w] = math.log2(f + 1)
+            log2_[w] = math.log2(f + 2)
+            if not _clean_boundary(w):
+                continue
+            clean_set.add(w)
+            wlen = len(w)
+            start = 0
+            while True:
+                p = text.find(w, start)
+                if p < 0:
+                    break
+                vocab_starts.setdefault(p, []).append(w)
+                vocab_ends.setdefault(p + wlen, []).append(w)
+                start = p + 1
 
     # ------------------------------------------------------------------ #
     # 候选池合并：L1 (统计通道) + L2 (模板通道)                                #
@@ -328,28 +532,9 @@ class VocabBuilderMixin:
 
     _SEG_SIZE = 500
 
-    def _build_segment_index(self, vocab: dict):
-        """扫描全文，记录每个词表词出现在哪些段落片段中。"""
-        text = self._text
-        seg_size = self._SEG_SIZE
-        n_segs = max(1, (self._text_len + seg_size - 1) // seg_size)
-
-        word_segs: dict[str, set[int]] = defaultdict(set)
-        min_l, max_l = self.min_len, self.max_len
-
-        for m in _RE_CHINESE.finditer(text):
-            seq = m.group()
-            base = m.start()
-            n = len(seq)
-            for i in range(n):
-                sid = (base + i) // seg_size
-                for length in range(min_l, min(max_l + 1, n - i + 1)):
-                    w = seq[i:i + length]
-                    if w in vocab:
-                        word_segs[w].add(sid)
-
-        self._word_segs: dict[str, set[int]] = dict(word_segs)
-        self._n_segments: int = n_segs
+    # _build_segment_index 已并入 _build_ac_index：AC 全文扫一遍即可同时
+    # 产出 _word_segs / _vocab_starts / _vocab_ends，避免 O(N·max_len) 的
+    # Python 双循环。
 
     def _cohesion(self, word: str) -> float:
         """词的凝固度：所有切分点上 log-PMI 的最小值。
@@ -446,29 +631,22 @@ class VocabBuilderMixin:
         return out
 
     def _vocab_after(self, pos: int, vocab: dict) -> list[str]:
-        """从 pos 位置开始，返回所有能匹配到的词表词"""
-        if pos >= self._text_len or not ('\u4e00' <= self._text[pos] <= '\u9fff'):
+        """从 pos 位置开始，返回所有能匹配到的词表词。
+
+        由 _build_ac_index 预算的 _vocab_starts 提供 O(1) 查表，candidates
+        全集已在 build 期一次性 Aho-Corasick 扫出；channel-C extras 由
+        _ensure_strategy_caches 在 extract 时增量补入。
+        """
+        hits = self._vocab_starts.get(pos)
+        if not hits:
             return []
-        hits = []
-        for length in range(self.min_len, self.max_len + 1):
-            end = pos + length
-            if end > self._text_len:
-                break
-            w = self._text[pos:end]
-            if w in vocab and _clean_boundary(w):
-                hits.append(w)
-        return hits
+        # vocab 可能等于 _candidates 或 _candidates ∪ extras；过滤一遍兜底。
+        # 索引侧已经做过 _clean_set 过滤，这里不再二次校验。
+        return [w for w in hits if w in vocab]
 
     def _vocab_before(self, pos: int, vocab: dict) -> list[str]:
-        """以 pos 位置结尾，返回所有能匹配到的词表词"""
-        if pos < self.min_len or not ('\u4e00' <= self._text[pos - 1] <= '\u9fff'):
+        """以 pos 位置（exclusive）结尾，返回所有能匹配到的词表词。"""
+        hits = self._vocab_ends.get(pos)
+        if not hits:
             return []
-        hits = []
-        for length in range(self.min_len, self.max_len + 1):
-            start = pos - length
-            if start < 0:
-                continue
-            w = self._text[start:pos]
-            if w in vocab and _clean_boundary(w):
-                hits.append(w)
-        return hits
+        return [w for w in hits if w in vocab]

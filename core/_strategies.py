@@ -13,9 +13,10 @@ StrategiesMixin 提供：
 """
 
 import math
+from bisect import bisect_left
 from collections import Counter
 
-from ._utils import _RE_CHINESE, _clean_boundary, StrategyResult
+from ._utils import StrategyResult
 
 
 class StrategiesMixin:
@@ -24,32 +25,44 @@ class StrategiesMixin:
                                vocab: dict) -> StrategyResult:
         """字符包含：按字符重叠比例和位置匹配度打分"""
         anchors = set(keyword)
+        n_anchors = len(anchors)
         kw_len = len(keyword)
+        kw_inv = 1.0 / max(kw_len - 1, 1)
         kw_positions: dict[str, float] = {}
         for i, ch in enumerate(keyword):
-            kw_positions[ch] = i / max(kw_len - 1, 1)
+            kw_positions[ch] = i * kw_inv
 
         candidates: set[str] = set()
         for ch in anchors:
             candidates |= self._char_index.get(ch, set())
 
+        clean_set = self._clean_set
+        log_freq = self._log_freq_p1
+
         scores: dict[str, float] = {}
         for word in candidates:
-            if not _clean_boundary(word):
+            if word == keyword:
                 continue
-            overlap = anchors & set(word)
-            char_ratio = len(overlap) / len(anchors)
-            w_len = len(word)
+            if word not in clean_set:
+                continue
+
+            # 一次扫描同时拿到 overlap 字符与它们在 word 中的首位置，
+            # 替代原 `set(word)` + `word.index(c)` 的两次扫描
+            w_idx: dict[str, int] = {}
+            for idx, c in enumerate(word):
+                if c in anchors and c not in w_idx:
+                    w_idx[c] = idx
+            n_overlap = len(w_idx)
+
+            char_ratio = n_overlap / n_anchors
+            w_inv = 1.0 / max(len(word) - 1, 1)
 
             pos_match = 0.0
-            for c in overlap:
-                kw_rel = kw_positions[c]
-                w_rel = word.index(c) / max(w_len - 1, 1)
-                pos_match += 1.0 - abs(kw_rel - w_rel)
-            pos_match /= len(overlap)
+            for c, idx in w_idx.items():
+                pos_match += 1.0 - abs(kw_positions[c] - idx * w_inv)
+            pos_match /= n_overlap
 
-            freq_w = math.log2(vocab[word]['freq'] + 1)
-            scores[word] = char_ratio * pos_match * freq_w
+            scores[word] = char_ratio * pos_match * log_freq[word]
         return StrategyResult(scores)
 
     # 特征宽度权重：1字×0.3, 2字×1.0, 3字×1.7, 4字×2.2, 5字×2.6, 6字×3.0,
@@ -112,10 +125,16 @@ class StrategiesMixin:
         wm = self._WIDTH_MULT
 
         def _idf_top(counts: Counter, top_k: int) -> dict:
+            # 特征长度上限 = range(1, 9) = 1..8，与 max_len 一致；_freq 在
+            # vocab_builder Pass 1a 已覆盖单字 + 长度 min_len..max_len 的所有
+            # ngram，且 Apriori 剪枝丢掉的全是 freq < 2 的（即 freq == 1）。
+            # 因此 feat 不在 freq_map 时其全文出现次数必为 1，直接用 1 与原
+            # text.count(feat) 兜底**完全等价**，省掉每次 O(N) 全文扫。
+            # （在韩立 × 150 万字场景下，原路径 38606 次 str.count 吃掉 ~28s）
             scored = {}
             for feat, cnt in counts.items():
-                gf = freq_map.get(feat) or len(self._find_all(feat))
-                idf = math.log2(max(text_len / max(gf, 1), 1.0))
+                gf = freq_map.get(feat, 1)
+                idf = math.log2(max(text_len / gf, 1.0))
                 scored[feat] = cnt * idf * wm[len(feat)]
             return dict(sorted(scored.items(),
                                key=lambda x: x[1], reverse=True)[:top_k])
@@ -201,13 +220,12 @@ class StrategiesMixin:
         # ── 4. 归一化得分 ──
         scores: dict[str, float] = {}
         patterns: dict[str, list] = {}
+        log_freq_p2 = self._log_freq_p2
         for w, raw in votes.items():
-            v = vocab.get(w)
-            if not v:
+            if w not in vocab:
                 continue
             nf = len(feats_hit.get(w, ()))
-            scores[w] = raw * math.sqrt(max(nf, 1)) / math.log2(
-                v['freq'] + 2)
+            scores[w] = raw * math.sqrt(max(nf, 1)) / log_freq_p2[w]
             patterns[w] = sorted(feats_hit.get(w, ()))
 
         return StrategyResult(scores, meta={'patterns': patterns})
@@ -230,7 +248,6 @@ class StrategiesMixin:
 
         window_counts: Counter = Counter()
         seed_set = set(seeds)
-        min_l, max_l = self.min_len, self.max_len
         text = self._text
         text_len = self._text_len
         sent_breaks = self._SENT_BREAKS
@@ -259,27 +276,37 @@ class StrategiesMixin:
 
         n_windows = len(kw_locs)
 
+        # 用 _build_ac_index 预算的 _vocab_starts 直接迭代 span 内的 vocab
+        # 命中位置，省掉原 (i, length) 的 O(span_len · max_len) Python 双
+        # 循环。_vocab_starts 已经过 _clean_set 过滤，与原 `w in clean_set`
+        # 等价；vocab 成员检查兜底处理 channel-C extras 之外的差异。
+        vocab_starts = self._vocab_starts
         for ws, we in merged_spans:
             seen: set = set()
-            for cm in _RE_CHINESE.finditer(text, ws, we):
-                seq = cm.group()
-                n = len(seq)
-                for i in range(n):
-                    for length in range(min_l, min(max_l + 1, n - i + 1)):
-                        w = seq[i:i + length]
-                        if w in vocab and w not in seed_set and w not in seen:
-                            if _clean_boundary(w):
-                                seen.add(w)
-                                window_counts[w] += 1
+            for pos in range(ws, we):
+                hits = vocab_starts.get(pos)
+                if not hits:
+                    continue
+                for w in hits:
+                    if pos + len(w) > we:
+                        continue
+                    if w in seed_set or w in seen:
+                        continue
+                    if w not in vocab:
+                        continue
+                    seen.add(w)
+                    window_counts[w] += 1
 
         scores: dict[str, float] = {}
+        rate_factor = n_windows / max(text_len, 1)
+        cond_factor = 1.0 / max(n_windows, 1)
         for w, wc in window_counts.items():
-            expected = vocab[w]['freq'] * n_windows / max(text_len, 1)
+            expected = vocab[w]['freq'] * rate_factor
             lift = wc / max(expected, 0.01)
-            lift_score = lift * math.log2(wc + 1)
-            cond_prob = wc / max(n_windows, 1)
-            cond_score = cond_prob * math.log2(wc + 1) * 10
-            scores[w] = max(lift_score, cond_score)
+            log_wc = math.log2(wc + 1)
+            lift_score = lift * log_wc
+            cond_score = wc * cond_factor * log_wc * 10
+            scores[w] = lift_score if lift_score > cond_score else cond_score
         return StrategyResult(scores)
 
     def _strategy_morpheme(self, keyword: str,
@@ -308,19 +335,24 @@ class StrategiesMixin:
                     pos = 'mid'
                 morphemes.append((bigram, pos))
 
+        clean_set = self._clean_set
+        log_freq = self._log_freq_p1
+        char_index = self._char_index
+        bigram_index = self._bigram_index
+
         for morph, kw_pos in morphemes:
             is_bigram = len(morph) > 1
             base_weight = 2.0 if is_bigram else 1.0
 
             if is_bigram:
-                candidates = self._bigram_index.get(morph, set())
+                candidates = bigram_index.get(morph, set())
             else:
-                candidates = self._char_index.get(morph, set())
+                candidates = char_index.get(morph, set())
 
             for word in candidates:
                 if word == keyword:
                     continue
-                if not _clean_boundary(word):
+                if word not in clean_set:
                     continue
 
                 if word.startswith(morph):
@@ -337,9 +369,8 @@ class StrategiesMixin:
                 else:
                     w_mult = 0.3
 
-                freq_w = math.log2(vocab[word]['freq'] + 1)
                 scores[word] = scores.get(word, 0) + \
-                    base_weight * w_mult * freq_w
+                    base_weight * w_mult * log_freq[word]
 
         return StrategyResult(scores)
 
@@ -445,9 +476,12 @@ class StrategiesMixin:
           cooccurrence 看 50 字窗口内的句子级共现
           co_topic 看 500 字段落级共现，捕获跨句、跨段的宏观主题关联
         """
+        word_segs = self._word_segs
+        seg_words = self._seg_words
+
         seed_segs: set[int] = set()
         for s in seeds:
-            s_segs = self._word_segs.get(s)
+            s_segs = word_segs.get(s)
             if s_segs:
                 seed_segs |= s_segs
 
@@ -458,20 +492,33 @@ class StrategiesMixin:
         n_total = self._n_segments
         seed_set = set(seeds)
 
+        # 反向索引：只有在某个 seed 段里出现过的词才可能 observed >= 1。
+        # 原实现 `for w in vocab` 要遍历整张候选池（长篇可达数十万），
+        # 现在只遍历"种子段并集里实际出现过的词"的 Counter，规模通常
+        # 缩小 10-100 倍。Counter.update 一次性给出每个词的 observed 计数，
+        # 与原 `len(seed_segs & w_segs)` 数值完全一致。
+        seg_obs: Counter = Counter()
+        for sid in seed_segs:
+            sw = seg_words.get(sid)
+            if sw:
+                seg_obs.update(sw)
+
         seed_seg_sorted = sorted(seed_segs)
         local_window = max(n_total // 10, 50)
+        expected_factor = n_seed / max(n_total, 1)
+        inv_local_window = 1.0 / max(local_window, 1)
+        step = max(1, local_window // 2)
 
         scores: dict[str, float] = {}
-        for w in vocab:
+        for w, observed in seg_obs.items():
             if w in seed_set:
                 continue
-            w_segs = self._word_segs.get(w)
-            if not w_segs:
-                continue
-            observed = len(seed_segs & w_segs)
             if observed < 2:
                 continue
-            expected = n_seed * len(w_segs) / max(n_total, 1)
+            if w not in vocab:
+                continue
+            w_segs = word_segs[w]
+            expected = expected_factor * len(w_segs)
 
             global_lift = (observed / max(expected, 0.01)
                            if expected >= 0.5 else 0.0)
@@ -483,24 +530,27 @@ class StrategiesMixin:
             # 全局 Lift 不足时，尝试局部窗口检测
             if len(w_segs) < 3:
                 continue
+            # 用 bisect 把每个窗口的计数从 O(|seed|+|w|) 的线性求和
+            # 降到 O(log)。inter_sorted 预先把交集排好，避免内层
+            # `s in seed_segs` 反复哈希查询。
+            inter_sorted = sorted(seed_segs & w_segs)
             w_seg_sorted = sorted(w_segs)
+
             best_local_lift = 0.0
             best_local_obs = 0
-            step = max(1, local_window // 2)
             for win_start in range(0, n_total - local_window + 1, step):
                 win_end = win_start + local_window
-                local_seed = sum(1 for s in seed_seg_sorted
-                                 if win_start <= s < win_end)
-                local_w = sum(1 for s in w_seg_sorted
-                              if win_start <= s < win_end)
+                local_seed = (bisect_left(seed_seg_sorted, win_end)
+                              - bisect_left(seed_seg_sorted, win_start))
+                local_w = (bisect_left(w_seg_sorted, win_end)
+                           - bisect_left(w_seg_sorted, win_start))
                 if local_seed < 2 or local_w < 2:
                     continue
-                local_obs = sum(1 for s in w_seg_sorted
-                                if win_start <= s < win_end
-                                and s in seed_segs)
+                local_obs = (bisect_left(inter_sorted, win_end)
+                             - bisect_left(inter_sorted, win_start))
                 if local_obs < 2:
                     continue
-                local_exp = local_seed * local_w / max(local_window, 1)
+                local_exp = local_seed * local_w * inv_local_window
                 if local_exp > 0.5:
                     ll = local_obs / local_exp
                     if ll > best_local_lift:

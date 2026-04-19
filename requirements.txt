@@ -2,3 +2,5 @@ streamlit
 pandas
 charset-normalizer
 jieba
+matplotlib
+pyahocorasick>=2.0

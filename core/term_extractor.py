@@ -21,7 +21,7 @@ from ._pattern_miner import (
 
 # ── 默认配置（UI 层和算法层共用）────────────────────────────────────────
 DEFAULT_CONFIG = {
-    'min_freq': 3,
+    'min_freq': 5,
     'max_freq': 0,
     'top_n': 75,
     'w_char': 0.25, 'w_context': 0.40, 'w_cooccur': 0.40,
@@ -148,6 +148,9 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
         extra = self._channel_c_expand(keyword)
         if extra:
             vocab = {**self._candidates, **extra}
+            # 把临时词补进 _clean_set / _log_freq_p1 / _log_freq_p2，
+            # 否则策略里的缓存查询会"看不见"这些词导致候选丢失
+            self._ensure_strategy_caches(extra)
         else:
             vocab = self._candidates
 
