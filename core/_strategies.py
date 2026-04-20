@@ -71,7 +71,9 @@ class StrategiesMixin:
     _PAIR_MULT = 2.5
 
     def _strategy_context_pattern(self, seeds: list[str], vocab: dict,
-                                  _max_scan: int = 600) -> StrategyResult:
+                                  _max_scan: int = 600,
+                                  seed_positions: dict | None = None
+                                  ) -> StrategyResult:
         """上下文特征投票：提取种子词多宽度上下文指纹，反向投票发现语义相似词
 
         算法：
@@ -80,6 +82,10 @@ class StrategiesMixin:
         2. 按 IDF × 宽度权重 加权，取 top-K
         3. 对每个高权重特征反向投票
         4. 得分 = 投票总分 × sqrt(命中特征种数) / log2(词频+2)
+
+        seed_positions: 可选 {seed: [pos, ...]} 覆盖。双关键词联合模式下用
+            "联合锚点位置" 替代 _find_all(seed)，使指纹只在 A、B 共现语境
+            中提取，避免单关键词时把无关同类词的上下文吸进来。
         """
         text = self._text
         text_len = self._text_len
@@ -95,7 +101,10 @@ class StrategiesMixin:
 
         n_occ = 0
         for seed in seeds:
-            positions = self._find_all(seed)
+            if seed_positions is not None:
+                positions = seed_positions.get(seed, [])
+            else:
+                positions = self._find_all(seed)
             n_occ += len(positions)
             slen = len(seed)
             for pos in positions:
@@ -234,11 +243,22 @@ class StrategiesMixin:
 
     def _strategy_cooccurrence(self, seeds: list[str], vocab: dict,
                                window: int = 50,
-                               _max_occ: int = 200) -> StrategyResult:
-        """共现近邻：统计在种子词窗口内高频出现的词，用 Lift 比率衡量关联强度"""
+                               _max_occ: int = 200,
+                               seed_positions: dict | None = None
+                               ) -> StrategyResult:
+        """共现近邻：统计在种子词窗口内高频出现的词，用 Lift 比率衡量关联强度
+
+        seed_positions: 可选 {seed: [pos, ...]} 覆盖。双关键词模式下传入
+            联合锚点位置，使共现窗口只覆盖 A、B 互为邻居的局部，把"在 AB
+            交集语境中富集"的词挤到前面。
+        """
         kw_locs: list[tuple[int, int]] = []
         for s in seeds:
-            kw_locs.extend((p, len(s)) for p in self._find_all(s))
+            if seed_positions is not None:
+                positions = seed_positions.get(s, [])
+            else:
+                positions = self._find_all(s)
+            kw_locs.extend((p, len(s)) for p in positions)
         if not kw_locs:
             return StrategyResult({})
         kw_locs.sort()
@@ -379,7 +399,9 @@ class StrategiesMixin:
     _FRAME_SPECS = ((2, 2, 2.5), (2, 1, 1.5), (1, 2, 1.5), (1, 1, 1.0))
 
     def _strategy_substitution(self, seeds: list[str], vocab: dict,
-                               _max_scan: int = 400) -> StrategyResult:
+                               _max_scan: int = 400,
+                               seed_positions: dict | None = None
+                               ) -> StrategyResult:
         """互替性：找能在相同上下文框架中替换种子词的词
 
         算法：
@@ -391,6 +413,9 @@ class StrategiesMixin:
           context_pattern 逐特征独立投票（左特征和右特征各自匹配）
           substitution 要求左右两侧同时匹配（完整框架），衡量的是
           "候选词能替换种子词出现在多少种上下文中"
+
+        seed_positions: 可选 {seed: [pos, ...]} 覆盖。当前 extract 在双关键词
+            模式下不传该参数，保持互替原行为；预留接口便于后续按需切换。
         """
         text = self._text
         text_len = self._text_len
@@ -407,7 +432,11 @@ class StrategiesMixin:
 
         for seed in seeds:
             slen = len(seed)
-            for pos in self._find_all(seed):
+            if seed_positions is not None:
+                positions = seed_positions.get(seed, [])
+            else:
+                positions = self._find_all(seed)
+            for pos in positions:
                 end = pos + slen
                 for lw, rw, fw in self._FRAME_SPECS:
                     ls = pos - lw
@@ -463,7 +492,9 @@ class StrategiesMixin:
         return StrategyResult(scores)
 
     def _strategy_co_topic(self, seeds: list[str],
-                           vocab: dict) -> StrategyResult:
+                           vocab: dict,
+                           seed_segs_override: set | None = None
+                           ) -> StrategyResult:
         """段落共主题：找与种子词在段落级别高度共现的词
 
         算法：
@@ -475,15 +506,22 @@ class StrategiesMixin:
         与 cooccurrence 的区别：
           cooccurrence 看 50 字窗口内的句子级共现
           co_topic 看 500 字段落级共现，捕获跨句、跨段的宏观主题关联
+
+        seed_segs_override: 双关键词联合模式下传入 word_segs[A] ∩ word_segs[B]，
+            把"主题种子段"换成 AB 共现段，让 lift 直接反映"在 AB 同台
+            出现的段落里富集程度"。
         """
         word_segs = self._word_segs
         seg_words = self._seg_words
 
-        seed_segs: set[int] = set()
-        for s in seeds:
-            s_segs = word_segs.get(s)
-            if s_segs:
-                seed_segs |= s_segs
+        if seed_segs_override is not None:
+            seed_segs = set(seed_segs_override)
+        else:
+            seed_segs = set()
+            for s in seeds:
+                s_segs = word_segs.get(s)
+                if s_segs:
+                    seed_segs |= s_segs
 
         if not seed_segs:
             return StrategyResult({})

@@ -9,6 +9,7 @@
 阶段三  extract      — 多信号归一化融合 + 交叉验证加分 + 后处理（本文件）
 """
 
+from bisect import bisect_right
 from collections import Counter, defaultdict
 
 from ._utils import _normalize, _LEFT_NOISE, _RIGHT_NOISE
@@ -61,6 +62,11 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
     TYPE_MISMATCH_PENALTY = 0.85     # 异类型乘子（两端都非 misc 才生效）
     TEMPLATE_FAMILY_BONUS = 0.08     # 模板同族加分
 
+    # 双关键词联合模式参数
+    JOINT_WINDOW = 1000               # 联合锚点窗口（A、B 距离阈值，字符）
+    JOINT_GATE_MIN_HITS = 1          # 联合证据硬门槛：至少要在多少联合窗口/段出现
+    JOINT_BONUS_ALPHA = 0.7          # 联合证据加分系数（score *= 1+α·joint_ratio）
+
     # 高置信度模板集合（L2 命中这些模板可豁免 min_freq 门槛）
     _HIGH_CONF_TEMPLATES = frozenset({
         'B1.dialog', 'B2.named', 'B5.role',
@@ -83,9 +89,17 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
     # 通道 C：关键词自适应模板（extract 运行时扩充候选池）                        #
     # ------------------------------------------------------------------ #
 
-    def _channel_c_expand(self, keyword: str) -> dict:
-        """用关键词上下文指纹从原文反向挖掘候选，不污染 self._candidates。"""
-        positions = self._find_all(keyword)
+    def _channel_c_expand(self, keyword: str,
+                          positions_override: list | None = None) -> dict:
+        """用关键词上下文指纹从原文反向挖掘候选，不污染 self._candidates。
+
+        positions_override: 双关键词模式下传入"靠近另一关键词的子集位置"，
+            让模板挖矿只看 AB 共现处，避免引入只跟单边强相关的临时词。
+        """
+        if positions_override is not None:
+            positions = positions_override
+        else:
+            positions = self._find_all(keyword)
         if not positions or not hasattr(self, '_pattern_miner'):
             return {}
         # 把已有 L1/L2 候选作为对齐字典，消除"只听张无忌"→"张无忌"
@@ -133,6 +147,105 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
         return infer_keyword_type(keyword)
 
     # ------------------------------------------------------------------ #
+    # 双关键词联合模式：纯位置工具函数                                          #
+    # ------------------------------------------------------------------ #
+
+    def _compute_joint_anchors(self, kw_a: str, kw_b: str,
+                               window: int):
+        """扫描 A、B 互为邻居的位置对。
+
+        返回 (pos_a_kept, pos_b_kept, pair_spans):
+          pos_a_kept   — A 出现位置中能在 ±window 字内找到 B 的子集
+          pos_b_kept   — 对称的 B 子集（去重排序）
+          pair_spans   — 每个 (a_pos, b_pos) 对覆盖的 [min, max+len) 区间
+        """
+        pa = self._find_all(kw_a)
+        pb = self._find_all(kw_b)
+        if not pa or not pb:
+            return [], [], []
+
+        la, lb = len(kw_a), len(kw_b)
+        pos_a_kept: list[int] = []
+        pos_b_set: set[int] = set()
+        pair_spans: list[tuple[int, int]] = []
+
+        n_b = len(pb)
+        j = 0
+        for ai in pa:
+            while j < n_b and pb[j] + lb < ai - window:
+                j += 1
+            k = j
+            kept = False
+            while k < n_b and pb[k] <= ai + la + window:
+                bi = pb[k]
+                kept = True
+                pos_b_set.add(bi)
+                left = ai if ai < bi else bi
+                right = (ai + la) if (ai + la) > (bi + lb) else (bi + lb)
+                pair_spans.append((left, right))
+                k += 1
+            if kept:
+                pos_a_kept.append(ai)
+
+        return pos_a_kept, sorted(pos_b_set), pair_spans
+
+    def _segments_of(self, kw: str) -> set[int]:
+        """词的段落集合，候选池有就直接取，没收录就按位置临时算。"""
+        cached = getattr(self, '_word_segs', {}).get(kw)
+        if cached is not None:
+            return cached
+        seg_size = getattr(self, '_SEG_SIZE', 500)
+        return {p // seg_size for p in self._find_all(kw)}
+
+    def _compute_joint_segments(self, kw_a: str, kw_b: str) -> set[int]:
+        """A、B 同时出现的段落集合。"""
+        return self._segments_of(kw_a) & self._segments_of(kw_b)
+
+    @staticmethod
+    def _max_fuse(scores_a: dict, scores_b: dict) -> dict:
+        """两路分数取并集后逐词取 max。"""
+        if not scores_b:
+            return dict(scores_a)
+        out = dict(scores_a)
+        for w, s in scores_b.items():
+            cur = out.get(w, 0.0)
+            if s > cur:
+                out[w] = s
+        return out
+
+    @staticmethod
+    def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        if not spans:
+            return []
+        spans = sorted(spans)
+        merged = [spans[0]]
+        for s, e in spans[1:]:
+            ps, pe = merged[-1]
+            if s <= pe:
+                merged[-1] = (ps, e if e > pe else pe)
+            else:
+                merged.append((s, e))
+        return merged
+
+    def _count_in_merged_spans(self, word: str,
+                               merged_spans: list[tuple[int, int]]) -> int:
+        """word 出现位置中落在任一 merged_span 内的次数。"""
+        if not merged_spans:
+            return 0
+        positions = self._find_all(word)
+        if not positions:
+            return 0
+        starts = [s for s, _ in merged_spans]
+        ends = [e for _, e in merged_spans]
+        wlen = len(word)
+        cnt = 0
+        for p in positions:
+            i = bisect_right(starts, p) - 1
+            if i >= 0 and p + wlen <= ends[i]:
+                cnt += 1
+        return cnt
+
+    # ------------------------------------------------------------------ #
     # 阶段三：多信号融合排序                                                  #
     # ------------------------------------------------------------------ #
 
@@ -140,21 +253,51 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
                 w_char: float = 0.25, w_context: float = 0.40,
                 w_cooccur: float = 0.40, w_morph: float = 0.15,
                 w_subst: float = 0.30, w_topic: float = 0.25,
-                max_freq: int = 0) -> list[dict]:
+                max_freq: int = 0,
+                aux_keyword: str = '') -> list[dict]:
         if not self._built:
             raise RuntimeError('请先调用 build_index(text)')
 
+        aux = (aux_keyword or '').strip()
+        if aux and aux == keyword:
+            aux = ''
+        dual = bool(aux)
+
         # ── 运行时候选池 = 持久候选 + 通道 C 扩充 ──
-        extra = self._channel_c_expand(keyword)
+        if dual:
+            # 双关键词：通道 C 仅在联合锚点位置展开，输出贴近 AB 共现语境
+            pos_a, pos_b, _spans = self._compute_joint_anchors(
+                keyword, aux, self.JOINT_WINDOW)
+            extra = self._channel_c_expand(
+                keyword, positions_override=pos_a or None)
+            extra_b = self._channel_c_expand(
+                aux, positions_override=pos_b or None)
+            for w, meta in extra_b.items():
+                if w in extra:
+                    base = extra[w]
+                    base['templates'] = (set(base.get('templates') or set())
+                                         | set(meta['templates']))
+                    base['origins'] = (set(base.get('origins') or set())
+                                       | set(meta['origins']))
+                    if not base.get('type'):
+                        base['type'] = meta['type']
+                    budget = 5 - len(base.get('evidence') or [])
+                    if budget > 0:
+                        base['evidence'] = ((base.get('evidence') or [])
+                                            + list(meta['evidence'][:budget]))
+                else:
+                    extra[w] = meta
+        else:
+            extra = self._channel_c_expand(keyword)
+
         if extra:
             vocab = {**self._candidates, **extra}
-            # 把临时词补进 _clean_set / _log_freq_p1 / _log_freq_p2，
-            # 否则策略里的缓存查询会"看不见"这些词导致候选丢失
             self._ensure_strategy_caches(extra)
         else:
             vocab = self._candidates
 
-        raw_scores, pattern_info = self._run_strategies(keyword, vocab)
+        raw_scores, pattern_info, joint_meta = self._run_strategies(
+            keyword, vocab, aux_keyword=aux if dual else None)
 
         n_char = _normalize(raw_scores['char_overlap'])
         n_context = _normalize(raw_scores['context_pattern'])
@@ -169,6 +312,14 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
         kw_type = self._keyword_type(keyword, vocab)
         kw_info = vocab.get(keyword) or {}
         kw_templates = set(kw_info.get('templates') or set())
+        aux_info = vocab.get(aux) or {} if dual else {}
+
+        # 双关键词联合证据：预算合并区间，循环里用作硬门槛与加分输入
+        merged_pair_spans: list[tuple[int, int]] = []
+        joint_segs: set[int] = set()
+        if joint_meta:
+            merged_pair_spans = self._merge_spans(joint_meta['pair_spans'])
+            joint_segs = joint_meta['joint_segs']
 
         miss = self.MISS_PENALTY
         results = []
@@ -178,6 +329,21 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
                 continue
             if not self._passes_freq_gate(info, min_freq, max_freq):
                 continue
+
+            # ── 双关键词：联合证据硬门槛 ──
+            joint_window_hits = 0
+            joint_seg_hits = 0
+            w_segs_total = 0
+            if dual:
+                joint_window_hits = self._count_in_merged_spans(
+                    word, merged_pair_spans)
+                w_segs = self._word_segs.get(word, set())
+                w_segs_total = len(w_segs)
+                joint_seg_hits = (len(w_segs & joint_segs)
+                                  if w_segs_total else 0)
+                if (joint_window_hits < self.JOINT_GATE_MIN_HITS
+                        and joint_seg_hits < self.JOINT_GATE_MIN_HITS):
+                    continue
 
             s_char = n_char.get(word, miss)
             s_context = n_context.get(word, miss)
@@ -193,19 +359,29 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
                                    s_morph, s_subst, s_topic) if s > 0)
             score += self.CROSS_BONUS * max(0, hits - 1)
 
-            # R5 类型先验
-            w_type = info.get('type')
-            if (kw_type and w_type and w_type != 'misc'
-                    and kw_type != 'misc'):
-                if w_type == kw_type:
-                    score *= self.TYPE_MATCH_BONUS
-                else:
-                    score *= self.TYPE_MISMATCH_PENALTY
+            # R5 类型先验：双关键词模式下关闭，避免 kw_type=A.type 错误压分
+            if not dual:
+                w_type = info.get('type')
+                if (kw_type and w_type and w_type != 'misc'
+                        and kw_type != 'misc'):
+                    if w_type == kw_type:
+                        score *= self.TYPE_MATCH_BONUS
+                    else:
+                        score *= self.TYPE_MISMATCH_PENALTY
 
             # R6 模板同族
             w_templates = set(info.get('templates') or set())
             if kw_templates and (kw_templates & w_templates):
                 score += self.TEMPLATE_FAMILY_BONUS
+
+            # ── 双关键词：联合证据加分（纯位置，无分类假设）──
+            if dual:
+                w_freq = max(info['freq'], 1)
+                ratio_win = joint_window_hits / w_freq
+                ratio_seg = (joint_seg_hits / w_segs_total
+                             if w_segs_total else 0.0)
+                joint_ratio = min(max(ratio_win, ratio_seg), 1.0)
+                score *= 1.0 + self.JOINT_BONUS_ALPHA * joint_ratio
 
             labels = []
             if s_char > 0:
@@ -243,13 +419,40 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
             })
 
         results.sort(key=lambda x: x['score'], reverse=True)
-        results = [r for r in results if r['word'] != keyword][:top_n]
+        exclude_top = {keyword}
+        if dual:
+            exclude_top.add(aux)
+        results = [r for r in results if r['word'] not in exclude_top][:top_n]
+
+        # 双关键词：先把辅关键词置顶（让它在主关键词后、算法结果前）
+        if dual:
+            aux_freq = self._freq.get(aux)
+            if aux_freq is None:
+                aux_freq = self._text.count(aux)
+            if aux_freq > 0:
+                aux_ev_snips = []
+                if aux_info.get('evidence'):
+                    aux_ev_snips = format_evidence_snippets(
+                        self._text, aux_info['evidence'], aux, max_count=2)
+                aux_entry = {
+                    'word': aux,
+                    'freq': aux_freq,
+                    'score': 9999.0,
+                    'strategies': '用户输入(辅)',
+                    'hit_count': 6,
+                    'matched_patterns': '',
+                    'tier': aux_info.get('tier', 'L1'),
+                    'type': aux_info.get('type') or '',
+                    'templates': '、'.join(
+                        sorted(aux_info.get('templates') or set())),
+                    'evidence': '  ∥  '.join(aux_ev_snips),
+                }
+                results = [aux_entry] + results
 
         kw_freq = self._freq.get(keyword)
         if kw_freq is None:
             kw_freq = self._text.count(keyword)
         if kw_freq > 0:
-            # 命中词本身的证据（若有）
             kw_ev_snips = []
             if kw_info.get('evidence'):
                 kw_ev_snips = format_evidence_snippets(
@@ -296,35 +499,94 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
     # 策略调度：单跳 + 结构驱动的小幅扩展                                        #
     # ------------------------------------------------------------------ #
 
-    def _run_strategies(self, keyword: str, vocab: dict):
-        """返回 (raw_scores_dict, pattern_info)
+    def _run_strategies(self, keyword: str, vocab: dict,
+                        aux_keyword: str | None = None):
+        """返回 (raw_scores_dict, pattern_info, joint_meta)
 
         raw_scores_dict 的 key 固定为六个策略名：
           char_overlap / context_pattern / cooccurrence /
           morpheme / substitution / co_topic
+
+        aux_keyword 非空 → 双关键词联合模式：
+          • char/morph：A 与 B 各跑一次后逐词取 max（任一边即可贡献信号）
+          • context/cooccur：seeds=[A,B] 但仅在联合锚点位置抽取/统计
+          • co_topic：seed_segs 改用 word_segs[A] ∩ word_segs[B]
+          • substitution：保持原行为（seeds=[A,B] 全位置），由用户后续调权
+        joint_meta：单关键词时为 None；双关键词时含 pair_spans / joint_segs，
+                    供 extract 做硬门槛与加分。
         """
         raw_char = self._strategy_char_overlap(keyword, vocab).scores
         raw_morph = self._strategy_morpheme(keyword, vocab).scores
 
-        if self._find_all(keyword):
-            seeds = [keyword]
-        else:
-            combined = {
-                w: raw_char.get(w, 0) + raw_morph.get(w, 0)
-                for w in set(raw_char) | set(raw_morph)
-            }
-            seeds = sorted(combined, key=combined.get, reverse=True)[:5]
+        joint_meta = None
 
-        if seeds:
-            res_ctx = self._strategy_context_pattern(seeds, vocab)
-            raw_context = res_ctx.scores
-            pattern_info = res_ctx.meta.get('patterns', {})
-            raw_cooccur = self._strategy_cooccurrence(seeds, vocab).scores
+        if aux_keyword:
+            # ── 字面、构词通道：A、B 各跑一次取 max ──
+            raw_char = self._max_fuse(
+                raw_char,
+                self._strategy_char_overlap(aux_keyword, vocab).scores,
+            )
+            raw_morph = self._max_fuse(
+                raw_morph,
+                self._strategy_morpheme(aux_keyword, vocab).scores,
+            )
+
+            # ── 联合锚点 / 联合段落 ──
+            pos_a, pos_b, pair_spans = self._compute_joint_anchors(
+                keyword, aux_keyword, self.JOINT_WINDOW)
+            joint_segs = self._compute_joint_segments(keyword, aux_keyword)
+            joint_meta = {
+                'pair_spans': pair_spans,
+                'joint_segs': joint_segs,
+                'pos_a': pos_a,
+                'pos_b': pos_b,
+            }
+
+            seeds = [keyword, aux_keyword]
+            seed_positions = {keyword: pos_a, aux_keyword: pos_b}
+            has_joint = bool(pair_spans) or bool(joint_segs)
+
+            if has_joint:
+                res_ctx = self._strategy_context_pattern(
+                    seeds, vocab, seed_positions=seed_positions)
+                raw_context = res_ctx.scores
+                pattern_info = res_ctx.meta.get('patterns', {})
+                raw_cooccur = self._strategy_cooccurrence(
+                    seeds, vocab, seed_positions=seed_positions).scores
+                raw_topic = self._strategy_co_topic(
+                    seeds, vocab,
+                    seed_segs_override=joint_segs).scores
+            else:
+                # 没有任何联合证据时降级为 [A,B] 双种子常规跑，避免空结果
+                res_ctx = self._strategy_context_pattern(seeds, vocab)
+                raw_context = res_ctx.scores
+                pattern_info = res_ctx.meta.get('patterns', {})
+                raw_cooccur = self._strategy_cooccurrence(seeds, vocab).scores
+                raw_topic = self._strategy_co_topic(seeds, vocab).scores
+
+            # 互替：按用户要求纳入体系，维持原行为
             raw_subst = self._strategy_substitution(seeds, vocab).scores
-            raw_topic = self._strategy_co_topic(seeds, vocab).scores
+
         else:
-            raw_context, pattern_info = {}, {}
-            raw_cooccur, raw_subst, raw_topic = {}, {}, {}
+            if self._find_all(keyword):
+                seeds = [keyword]
+            else:
+                combined = {
+                    w: raw_char.get(w, 0) + raw_morph.get(w, 0)
+                    for w in set(raw_char) | set(raw_morph)
+                }
+                seeds = sorted(combined, key=combined.get, reverse=True)[:5]
+
+            if seeds:
+                res_ctx = self._strategy_context_pattern(seeds, vocab)
+                raw_context = res_ctx.scores
+                pattern_info = res_ctx.meta.get('patterns', {})
+                raw_cooccur = self._strategy_cooccurrence(seeds, vocab).scores
+                raw_subst = self._strategy_substitution(seeds, vocab).scores
+                raw_topic = self._strategy_co_topic(seeds, vocab).scores
+            else:
+                raw_context, pattern_info = {}, {}
+                raw_cooccur, raw_subst, raw_topic = {}, {}, {}
 
         return {
             'char_overlap': raw_char,
@@ -333,7 +595,7 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
             'morpheme': raw_morph,
             'substitution': raw_subst,
             'co_topic': raw_topic,
-        }, pattern_info
+        }, pattern_info, joint_meta
 
     _INDEP_FRAGMENT_THRESHOLD = 0.15
     _INDEP_PHRASE_FREQ_RATIO = 0.05

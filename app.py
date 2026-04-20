@@ -141,9 +141,15 @@ if uploaded_file is not None:
 
         cfg = DEFAULT_CONFIG
 
-        col_kw, col_min, col_max, col_top = st.columns([2, 1, 1, 1])
+        col_kw, col_aux, col_min, col_max, col_top = st.columns([2, 2, 1, 1, 1])
         with col_kw:
-            keyword = st.text_input("关键词", placeholder="例：丹药、功法、剑诀")
+            keyword = st.text_input("关键词", placeholder="例：霍雨浩、丹药")
+        with col_aux:
+            aux_keyword = st.text_input(
+                "辅关键词（可选）", placeholder="例：魂环、武魂",
+                help="填入后启用「双关键词联合模式」，只输出在原文中"
+                     "和两个关键词都强相关（共现）的术语",
+            )
         with col_min:
             min_freq = st.slider(
                 "最低出现频次", min_value=2, max_value=2000,
@@ -186,34 +192,58 @@ if uploaded_file is not None:
                                     key="w_topic")
 
         if keyword:
-            with st.spinner(f"正在提取与「{keyword}」相关的术语……"):
+            aux_kw = (aux_keyword or '').strip()
+            if aux_kw and aux_kw == keyword.strip():
+                aux_kw = ''
+            spin_msg = (f"正在提取与「{keyword}」+「{aux_kw}」联合相关的术语……"
+                        if aux_kw
+                        else f"正在提取与「{keyword}」相关的术语……")
+            with st.spinner(spin_msg):
                 results = extractor.extract(
                     keyword, top_n=top_n, min_freq=min_freq,
                     w_char=w_char, w_context=w_context,
                     w_cooccur=w_cooccur, w_morph=w_morph,
                     w_subst=w_subst, w_topic=w_topic,
                     max_freq=max_freq,
+                    aux_keyword=aux_kw,
                 )
 
             if not results:
-                st.warning(
-                    f"没有找到与「{keyword}」相关且频次 ≥ {min_freq} 的术语，"
-                    "请尝试降低最低频次或更换关键词。"
-                )
+                if aux_kw:
+                    st.warning(
+                        f"没有找到与「{keyword}」+「{aux_kw}」联合相关且"
+                        f"频次 ≥ {min_freq} 的术语，可能两个关键词在原文中"
+                        "共现过少。请放宽频次门槛、更换关键词，或改用单关键词。"
+                    )
+                else:
+                    st.warning(
+                        f"没有找到与「{keyword}」相关且频次 ≥ {min_freq} 的术语，"
+                        "请尝试降低最低频次或更换关键词。"
+                    )
             else:
                 dict_filter: DictFilter = st.session_state["dict_filter"]
                 dict_filter.tag_results(results)
 
-                pinned = results[0] if results[0].get('strategies') == '用户输入' else None
-                algo_results = results[1:] if pinned else results
+                pinned_strats = {'用户输入', '用户输入(辅)'}
+                pinned_list = []
+                idx = 0
+                while (idx < len(results)
+                       and results[idx].get('strategies') in pinned_strats):
+                    pinned_list.append(results[idx])
+                    idx += 1
+                algo_results = results[idx:]
+                pinned = pinned_list[0] if pinned_list else None
 
-                if pinned:
-                    pinned_children = pinned.get('children', [])
-                    suffix = (f"，含 **{len(pinned_children)}** 个从属子术语"
-                              if pinned_children else "")
+                for p in pinned_list:
+                    p_children = p.get('children', [])
+                    suffix = (f"，含 **{len(p_children)}** 个从属子术语"
+                              if p_children else "")
+                    role = ("**辅关键词**"
+                            if p.get('strategies') == '用户输入(辅)'
+                            else "**直接命中**")
                     st.info(
-                        f"📌 **直接命中**　关键词「**{pinned['word']}**」"
-                        f"在全文中共出现 **{pinned['freq']:,}** 次{suffix}"
+                        f"📌 {role}　关键词「**{p['word']}**」"
+                        f"在全文中共出现 **{p['freq']:,}** 次{suffix}"
                     )
 
                 algo_count = sum(
