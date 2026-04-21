@@ -52,13 +52,23 @@ def _entropy(counter: Counter) -> float:
 
 
 def _normalize(scores: dict) -> dict:
+    """按值归一化：每个策略的分数除以该策略的最大值。
+
+    保留策略内部的原始分布形状，让策略内部精心设计的刻度
+    （Lift、log_freq、√coverage、IDF 等）在融合时真正生效：
+
+    - 策略坚定支持少数词时，首位和次位的差距按原始比例保留；
+    - 策略没有强观点（分数分布平坦）时，所有候选拿到相近分数，
+      等价于该策略在融合中"弃权"，让有观点的策略主导；
+    - 策略内部对低频真词的倾斜（高 Lift / 低 log_freq 除数）
+      被原样传导到融合层，不会被排名压扁。
+    """
     if not scores:
         return {}
-    n = len(scores)
-    if n == 1:
-        return {k: 1.0 for k in scores}
-    sorted_words = sorted(scores, key=scores.get, reverse=True)
-    return {w: 1.0 - i / (n - 1) for i, w in enumerate(sorted_words)}
+    max_score = max(scores.values())
+    if max_score <= 0:
+        return {w: 0.0 for w in scores}
+    return {w: s / max_score for w, s in scores.items()}
 
 
 def _clean_boundary(word: str) -> bool:

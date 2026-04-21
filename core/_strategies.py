@@ -23,7 +23,13 @@ class StrategiesMixin:
 
     def _strategy_char_overlap(self, keyword: str,
                                vocab: dict) -> StrategyResult:
-        """字符包含：按字符重叠比例和位置匹配度打分"""
+        """字符包含：按字符重叠比例和位置匹配度打分
+
+        只衡量"字面/位置相似度"这一件事，不再乘 log_freq：
+        词频的信号由 cooccurrence / co_topic 等策略承担，这里乘频率
+        会让"恰好共字但与关键词无实质关联的高频词"（如关键词
+        带'魂'时的'魂力'）把共字的低频真词压到最底。
+        """
         anchors = set(keyword)
         n_anchors = len(anchors)
         kw_len = len(keyword)
@@ -37,11 +43,16 @@ class StrategiesMixin:
             candidates |= self._char_index.get(ch, set())
 
         clean_set = self._clean_set
-        log_freq = self._log_freq_p1
 
         scores: dict[str, float] = {}
         for word in candidates:
-            if word == keyword:
+            # 过滤"含关键词作为连续子串"的候选（也包含 word == keyword）：
+            # 这些通常是关键词的扩展复合词（如关键词"魂兽"下的"魂兽师"、
+            # "魂兽之力"），字符重合度和位置匹配都必然是 1.0，会垄断本
+            # 策略的 max 值，通过 C2 归一化把真正的兄弟词（如"柔骨兔"、
+            # "人面魔蛛"）压到很低。这类扩展词由其他策略从语境维度继续
+            # 评估即可，不该在"字面相似度"通道里占用头部位置。
+            if keyword in word:
                 continue
             if word not in clean_set:
                 continue
@@ -62,7 +73,7 @@ class StrategiesMixin:
                 pos_match += 1.0 - abs(kw_positions[c] - idx * w_inv)
             pos_match /= n_overlap
 
-            scores[word] = char_ratio * pos_match * log_freq[word]
+            scores[word] = char_ratio * pos_match
         return StrategyResult(scores)
 
     # 特征宽度权重：1字×0.3, 2字×1.0, 3字×1.7, 4字×2.2, 5字×2.6, 6字×3.0,
@@ -331,7 +342,12 @@ class StrategiesMixin:
 
     def _strategy_morpheme(self, keyword: str,
                            vocab: dict) -> StrategyResult:
-        """构词结构相似：找与关键词共享核心语素且语素位置相同的词"""
+        """构词结构相似：找与关键词共享核心语素且语素位置相同的词
+
+        与 char_overlap 同理，去掉 × log_freq：这里衡量的是"构词位置
+        相似度"，词频的信号交给其他策略，避免高频共语素词把低频真词
+        （如"泰坦巨猿""人面魔蛛"）在此策略里压成 0。
+        """
         scores: dict[str, float] = {}
 
         morphemes: list[tuple[str, str]] = []
@@ -356,7 +372,6 @@ class StrategiesMixin:
                 morphemes.append((bigram, pos))
 
         clean_set = self._clean_set
-        log_freq = self._log_freq_p1
         char_index = self._char_index
         bigram_index = self._bigram_index
 
@@ -370,7 +385,11 @@ class StrategiesMixin:
                 candidates = char_index.get(morph, set())
 
             for word in candidates:
-                if word == keyword:
+                # 同 char_overlap：过滤"含关键词作为连续子串"的候选。
+                # 2 字关键词下这个问题尤其严重——bigram morpheme 恰好
+                # 就是关键词本身，任何含关键词前缀/后缀的扩展词都会拿
+                # 满 2.0 × 1.5 的 bigram 分，把共享单字的兄弟词压成零头。
+                if keyword in word:
                     continue
                 if word not in clean_set:
                     continue
@@ -390,7 +409,7 @@ class StrategiesMixin:
                     w_mult = 0.3
 
                 scores[word] = scores.get(word, 0) + \
-                    base_weight * w_mult * log_freq[word]
+                    base_weight * w_mult
 
         return StrategyResult(scores)
 
@@ -407,7 +426,14 @@ class StrategiesMixin:
         算法：
         1. 在种子词每个出现位置，提取多宽度 (左n字, 右n字) 上下文框架
         2. 对每个框架，在全文中搜索能填入该框架的其他词表词
-        3. 得分 = 共享框架加权总分 × sqrt(覆盖率)
+        3. 得分 = 共享框架加权总分 × sqrt(覆盖率) / log(候选词频)
+
+        关于频率偏置的抑制：
+          - 框架加权引入 IDF：seed_frames[f] += fw × log(N / max(freq(left),
+            freq(right)))，使 "的X的 / 了X了" 这类由高频虚词字构成的通用
+            框架权重自动趋近 0，无需硬删 (1,1) 规格。
+          - 最终分除以 log_freq_p2[w]，和 _strategy_context_pattern 对齐，
+            压制高频候选词靠偶然命中堆分的现象。
 
         与 context_pattern 的区别：
           context_pattern 逐特征独立投票（左特征和右特征各自匹配）
@@ -420,12 +446,27 @@ class StrategiesMixin:
         text = self._text
         text_len = self._text_len
         seed_set = set(seeds)
+        freq_map = self._freq
 
         def _all_cjk(s: str) -> bool:
             for c in s:
                 if not ('\u4e00' <= c <= '\u9fff'):
                     return False
             return True
+
+        # 框架 IDF：两侧中更常见那一侧是框架稀有度的上界，只要一侧为
+        # 高频虚词字（的/了/是 …），整个框架的信息量就被它压死。
+        frame_idf_cache: dict[tuple[str, str], float] = {}
+
+        def _frame_idf(frame: tuple[str, str]) -> float:
+            cached = frame_idf_cache.get(frame)
+            if cached is not None:
+                return cached
+            left, right = frame
+            max_freq = max(freq_map.get(left, 1), freq_map.get(right, 1), 1)
+            idf = math.log2(max(text_len / max_freq, 2.0))
+            frame_idf_cache[frame] = idf
+            return idf
 
         # ── 1. 收集种子词的上下文框架 ──
         seed_frames: dict[tuple[str, str], float] = {}
@@ -448,7 +489,8 @@ class StrategiesMixin:
                     if not _all_cjk(left) or not _all_cjk(right):
                         continue
                     frame = (left, right)
-                    seed_frames[frame] = seed_frames.get(frame, 0) + fw
+                    w = fw * _frame_idf(frame)
+                    seed_frames[frame] = seed_frames.get(frame, 0) + w
 
         if not seed_frames:
             return StrategyResult({})
@@ -482,12 +524,15 @@ class StrategiesMixin:
                         word_weight[w] = word_weight.get(w, 0) + frame_w
 
         # ── 3. 计算得分 ──
+        # 除以 log_freq_p2[w]：候选词越高频，惩罚越大，抵消 "高频词靠运气
+        # 偶然命中框架" 的虚假增益，与 _strategy_context_pattern 一致。
+        log_freq_p2 = self._log_freq_p2
         scores: dict[str, float] = {}
         for w, frames in word_frames.items():
             n_shared = len(frames)
             coverage = n_shared / max(n_frames, 1)
             weighted = sum(seed_frames[f] for f in frames)
-            scores[w] = weighted * math.sqrt(coverage)
+            scores[w] = weighted * math.sqrt(coverage) / log_freq_p2[w]
 
         return StrategyResult(scores)
 

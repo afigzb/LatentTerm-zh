@@ -24,7 +24,7 @@ from ._pattern_miner import (
 DEFAULT_CONFIG = {
     'min_freq': 5,
     'max_freq': 0,
-    'top_n': 75,
+    'top_n': 1000,
     'w_char': 0.25, 'w_context': 0.40, 'w_cooccur': 0.40,
     'w_morph': 0.15, 'w_subst': 0.30, 'w_topic': 0.25,
 }
@@ -50,16 +50,12 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
     FILTER_DOM_STRICT = 8
     FILTER_DOM_LENIENT = 20
 
-    # 评分融合（extract 使用）
-    MISS_PENALTY = -0.03
-    CROSS_BONUS = 0.1
-
-    # 策略内部衰减
-    CONTEXT_DECAY = 0.7
-
     # 类型先验 & 模板同族（R5 / R6）
-    TYPE_MATCH_BONUS = 1.30          # 同类型乘子
-    TYPE_MISMATCH_PENALTY = 0.85     # 异类型乘子（两端都非 misc 才生效）
+    # 类型先验改为加法式"弱证据"：同类加分，异类不处理。
+    # 原因：类型推断是启发式的，乘法放大会让一次误判同时砸掉/抬高
+    # 一大截；而且异类扣分在双关键词模式下已经被关闭过一次，说明
+    # 它的置信度不配当"仲裁器"，降级为和模板同族同量级的加分更稳。
+    TYPE_MATCH_BONUS = 0.08          # 同类加分（加法）
     TEMPLATE_FAMILY_BONUS = 0.08     # 模板同族加分
 
     # 双关键词联合模式参数
@@ -321,7 +317,6 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
             merged_pair_spans = self._merge_spans(joint_meta['pair_spans'])
             joint_segs = joint_meta['joint_segs']
 
-        miss = self.MISS_PENALTY
         results = []
         for word in all_words:
             info = vocab.get(word)
@@ -345,29 +340,33 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
                         and joint_seg_hits < self.JOINT_GATE_MIN_HITS):
                     continue
 
-            s_char = n_char.get(word, miss)
-            s_context = n_context.get(word, miss)
-            s_cooccur = n_cooccur.get(word, miss)
-            s_morph = n_morph.get(word, miss)
-            s_subst = n_subst.get(word, miss)
-            s_topic = n_topic.get(word, miss)
+            # 缺席策略直接给 0。原本的 MISS_PENALTY 是为了配合"命中越多
+            # 策略越好"的 CROSS_BONUS 机制，两者方向相反但逻辑同源；现在
+            # 六策略只作为多角度捞候选的通道，命中数不再参与打分，缺席
+            # 自然就是 0 贡献。
+            s_char = n_char.get(word, 0.0)
+            s_context = n_context.get(word, 0.0)
+            s_cooccur = n_cooccur.get(word, 0.0)
+            s_morph = n_morph.get(word, 0.0)
+            s_subst = n_subst.get(word, 0.0)
+            s_topic = n_topic.get(word, 0.0)
 
             score = (w_char * s_char + w_context * s_context
                      + w_cooccur * s_cooccur + w_morph * s_morph
                      + w_subst * s_subst + w_topic * s_topic)
+            # hits 只用于 UI 展示 (hit_count)，不再参与打分。
+            # 低频真词天然命中策略少（物理上限），用命中数加分会
+            # 系统性地打压它们，与"多角度捞候选"的初衷冲突。
             hits = sum(1 for s in (s_char, s_context, s_cooccur,
                                    s_morph, s_subst, s_topic) if s > 0)
-            score += self.CROSS_BONUS * max(0, hits - 1)
 
-            # R5 类型先验：双关键词模式下关闭，避免 kw_type=A.type 错误压分
+            # R5 类型先验：同类加分（加法式弱证据）
+            # 双关键词模式下关闭，避免 kw_type=A.type 错误加分到 B 的亲族词
             if not dual:
                 w_type = info.get('type')
                 if (kw_type and w_type and w_type != 'misc'
-                        and kw_type != 'misc'):
-                    if w_type == kw_type:
-                        score *= self.TYPE_MATCH_BONUS
-                    else:
-                        score *= self.TYPE_MISMATCH_PENALTY
+                        and kw_type != 'misc' and w_type == kw_type):
+                    score += self.TYPE_MATCH_BONUS
 
             # R6 模板同族
             w_templates = set(info.get('templates') or set())
