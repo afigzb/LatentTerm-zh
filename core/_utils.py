@@ -52,22 +52,37 @@ def _entropy(counter: Counter) -> float:
 
 
 def _normalize(scores: dict) -> dict:
-    """按值归一化：每个策略的分数除以该策略的最大值。
+    """按值归一化 + 尖锐度衰减：s/max × (1 - mean/max)。
 
-    保留策略内部的原始分布形状，让策略内部精心设计的刻度
-    （Lift、log_freq、√coverage、IDF 等）在融合时真正生效：
+    纯 s/max 会把离散 / 粗粒度策略（char_overlap、morpheme）的"塌顶高原"
+    原样送进融合层——几十个候选并列在 max，每人白拿 w_char + w_morph
+    ≈ 0.40 的绝对分，挤压真正有区分度的通道（cooccurrence / context /
+    co_topic）对排名的影响。
 
-    - 策略坚定支持少数词时，首位和次位的差距按原始比例保留；
-    - 策略没有强观点（分数分布平坦）时，所有候选拿到相近分数，
-    - 策略内部对低频真词的倾斜（高 Lift / 低 log_freq 除数）
-      被原样传导到融合层，不会被排名压扁。
+    加一个尖锐度因子 sharpness = 1 - mean/max：
+      - Lift / IDF 类陡分布：mean/max 很小 → sharpness ≈ 1，几乎无影响，
+        保留策略内部精心设计刻度的原始坡度；
+      - 塌顶高原：mean/max 接近 1 → sharpness ≈ 0，整个策略自动降权，
+        "没话可说时不占用融合的绝对分数"；
+      - 中间情况按比例衰减。
+
+    这样六策略仍然共用一个归一化函数，但每条通道对融合的贡献自动按
+    "本次是否真的有区分度"加权，不需要用户调 w_* 来手动补偿。
+
+    单一候选视为稀有强证据，保留满分 1.0（没有对比对象时不做衰减）。
     """
     if not scores:
         return {}
-    max_score = max(scores.values())
+    vals = list(scores.values())
+    max_score = max(vals)
     if max_score <= 0:
         return {w: 0.0 for w in scores}
-    return {w: s / max_score for w, s in scores.items()}
+    n = len(vals)
+    if n == 1:
+        return {w: 1.0 for w in scores}
+    mean_score = sum(vals) / n
+    sharpness = 1.0 - mean_score / max_score  # ∈ [0, 1)
+    return {w: (s / max_score) * sharpness for w, s in scores.items()}
 
 
 def _clean_boundary(word: str) -> bool:

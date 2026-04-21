@@ -25,8 +25,8 @@ DEFAULT_CONFIG = {
     'min_freq': 5,
     'max_freq': 0,
     'top_n': 1000,
-    'w_char': 0.25, 'w_context': 0.40, 'w_cooccur': 0.40,
-    'w_morph': 0.15, 'w_subst': 0.30, 'w_topic': 0.25,
+    'w_char': 0.1, 'w_context': 0.50, 'w_cooccur': 0.35,
+    'w_morph': 0.1, 'w_subst': 0.3, 'w_topic': 0.25,
 }
 
 
