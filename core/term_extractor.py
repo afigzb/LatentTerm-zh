@@ -9,8 +9,10 @@
 阶段三  extract      — 多信号归一化融合 + 交叉验证加分 + 后处理（本文件）
 """
 
+import math
 from bisect import bisect_right
 from collections import Counter, defaultdict
+from heapq import heappop, heappush
 
 from ._utils import _normalize, _LEFT_NOISE, _RIGHT_NOISE
 from ._vocab_builder import VocabBuilderMixin
@@ -24,7 +26,7 @@ from ._pattern_miner import (
 DEFAULT_CONFIG = {
     'min_freq': 5,
     'max_freq': 0,
-    'top_n': 1000,
+    'top_n': 4000,
     'w_char': 0.1, 'w_context': 0.50, 'w_cooccur': 0.35,
     'w_morph': 0.1, 'w_subst': 0.3, 'w_topic': 0.25,
 }
@@ -60,8 +62,14 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
 
     # 双关键词联合模式参数
     JOINT_WINDOW = 1000               # 联合锚点窗口（A、B 距离阈值，字符）
-    JOINT_GATE_MIN_HITS = 1          # 联合证据硬门槛：至少要在多少联合窗口/段出现
-    JOINT_BONUS_ALPHA = 0.7          # 联合证据加分系数（score *= 1+α·joint_ratio）
+    JOINT_DECAY_TAU = 200             # 每对 (A,B) 距离衰减时间常数：w = exp(-d/τ)
+    # 硬门槛改为"显著性检验"：观测 >= max(floor, MULT × 期望)
+    # 期望 = 候选频次 × 联合区间占全文比例（段落同理）。这样高频通用词
+    # 想通过必须显著超基线，低频真词只要一次命中即可过门槛。
+    JOINT_GATE_MULT = 2.0             # 显著性倍数：观测至少达到期望的多少倍
+    JOINT_GATE_MIN_WIN = 0.5          # 窗口加权命中下限（≈半个紧邻对）
+    JOINT_GATE_MIN_SEG = 1            # 段落共现次数下限（整数，段落无衰减）
+    JOINT_BONUS_ALPHA = 0.7           # 联合证据加分系数（score *= 1+α·joint_ratio）
 
     # 高置信度模板集合（L2 命中这些模板可豁免 min_freq 门槛）
     _HIGH_CONF_TEMPLATES = frozenset({
@@ -147,23 +155,45 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
     # ------------------------------------------------------------------ #
 
     def _compute_joint_anchors(self, kw_a: str, kw_b: str,
-                               window: int):
-        """扫描 A、B 互为邻居的位置对。
+                               window: int,
+                               decay_tau: float | None = None):
+        """扫描 A、B 互为邻居的位置对，并按字面间距衰减给每对打权重。
 
         返回 (pos_a_kept, pos_b_kept, pair_spans):
           pos_a_kept   — A 出现位置中能在 ±window 字内找到 B 的子集
           pos_b_kept   — 对称的 B 子集（去重排序）
-          pair_spans   — 每个 (a_pos, b_pos) 对覆盖的 [min, max+len) 区间
+          pair_spans   — list[(left, right, weight)]
+                         left/right 为 [min_pos, max_pos+len) 区间，
+                         weight = exp(-d/τ)，d 为 A、B 之间的字符空隙
+                         （相邻/重叠为 0），τ 默认取 JOINT_DECAY_TAU。
+                         紧邻共现权重接近 1，边缘窗口共现权重接近 0。
+
+        结果按 (text 身份, kw_a, kw_b, window, decay_tau) 做实例级缓存，
+        避免 extract 与 _run_strategies 各算一次。文本重新建索引时
+        id(self._text) 会变，缓存自然失效。
         """
+        tau = decay_tau if decay_tau is not None else self.JOINT_DECAY_TAU
+        cache = getattr(self, '_joint_anchor_cache', None)
+        text_id = id(self._text)
+        if cache is None or cache.get('_text_id') != text_id:
+            cache = {'_text_id': text_id}
+            self._joint_anchor_cache = cache
+        cache_key = (kw_a, kw_b, window, tau)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         pa = self._find_all(kw_a)
         pb = self._find_all(kw_b)
         if not pa or not pb:
-            return [], [], []
+            empty: tuple = ([], [], [])
+            cache[cache_key] = empty
+            return empty
 
         la, lb = len(kw_a), len(kw_b)
         pos_a_kept: list[int] = []
         pos_b_set: set[int] = set()
-        pair_spans: list[tuple[int, int]] = []
+        pair_spans: list[tuple[int, int, float]] = []
 
         n_b = len(pb)
         j = 0
@@ -172,18 +202,30 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
                 j += 1
             k = j
             kept = False
-            while k < n_b and pb[k] <= ai + la + window:
+            a_end = ai + la
+            while k < n_b and pb[k] <= a_end + window:
                 bi = pb[k]
+                b_end = bi + lb
                 kept = True
                 pos_b_set.add(bi)
                 left = ai if ai < bi else bi
-                right = (ai + la) if (ai + la) > (bi + lb) else (bi + lb)
-                pair_spans.append((left, right))
+                right = a_end if a_end > b_end else b_end
+                # A、B 字面间距（不重叠为 0），决定本对的距离衰减权重
+                if a_end <= bi:
+                    d = bi - a_end
+                elif b_end <= ai:
+                    d = ai - b_end
+                else:
+                    d = 0
+                weight = math.exp(-d / tau) if tau > 0 else 1.0
+                pair_spans.append((left, right, weight))
                 k += 1
             if kept:
                 pos_a_kept.append(ai)
 
-        return pos_a_kept, sorted(pos_b_set), pair_spans
+        result = (pos_a_kept, sorted(pos_b_set), pair_spans)
+        cache[cache_key] = result
+        return result
 
     def _segments_of(self, kw: str) -> set[int]:
         """词的段落集合，候选池有就直接取，没收录就按位置临时算。"""
@@ -198,48 +240,135 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
         return self._segments_of(kw_a) & self._segments_of(kw_b)
 
     @staticmethod
-    def _max_fuse(scores_a: dict, scores_b: dict) -> dict:
-        """两路分数取并集后逐词取 max。"""
+    def _geom_fuse(scores_a: dict, scores_b: dict,
+                   eps: float = 0.02) -> dict:
+        """两路分数的几何平均融合（带 ε 平滑）。
+
+        相比原 _max_fuse 的"一边像就够"，几何平均要求候选与 A、B 两边
+        同时带一定相似度才能拿高分；仅单边贡献的词得分被显著压制。
+
+        实现：
+          1. 各路按自身最大值归一化到 [0,1]，消除尺度差（char 与 morph
+             的绝对分数量级不同，但后续 _normalize 会再次按 max 归一，
+             这里的预归一只影响"双边占比"的公允度）。
+          2. out = sqrt((a+ε)(b+ε)) - ε
+             - (0, 0) → 0（完全零分的词仍为 0）
+             - (1, 0) → ≈ √ε ≈ 0.13（单边满分受强力压制）
+             - (1, 1) → ≈ 1
+             - (1, 0.5) → ≈ 0.71（双边同强 > 单边满分）
+        """
         if not scores_b:
             return dict(scores_a)
-        out = dict(scores_a)
-        for w, s in scores_b.items():
-            cur = out.get(w, 0.0)
-            if s > cur:
-                out[w] = s
+        if not scores_a:
+            return dict(scores_b)
+        max_a = max(scores_a.values()) or 1.0
+        max_b = max(scores_b.values()) or 1.0
+        out: dict = {}
+        for w in set(scores_a) | set(scores_b):
+            a = scores_a.get(w, 0.0) / max_a
+            b = scores_b.get(w, 0.0) / max_b
+            out[w] = math.sqrt((a + eps) * (b + eps)) - eps
         return out
 
     @staticmethod
-    def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
-        if not spans:
-            return []
-        spans = sorted(spans)
-        merged = [spans[0]]
-        for s, e in spans[1:]:
-            ps, pe = merged[-1]
-            if s <= pe:
-                merged[-1] = (ps, e if e > pe else pe)
-            else:
-                merged.append((s, e))
-        return merged
+    def _decompose_weighted_spans(
+            pair_spans: list) -> list[tuple[int, int, float]]:
+        """把带权 pair_spans 扫描线扁平化为"非重叠 (s, e, max_w) 段"。
 
-    def _count_in_merged_spans(self, word: str,
-                               merged_spans: list[tuple[int, int]]) -> int:
-        """word 出现位置中落在任一 merged_span 内的次数。"""
-        if not merged_spans:
-            return 0
-        positions = self._find_all(word)
-        if not positions:
-            return 0
-        starts = [s for s, _ in merged_spans]
-        ends = [e for _, e in merged_spans]
+        每一段 max_w 是原列表中所有覆盖此区间的 span 权重最大值；
+        相邻同权段自动合并以减少段数。使用懒删除最大堆，复杂度
+        O(E log E)，E = 2|pair_spans|。
+
+        有了扁平化结果，每个候选词的位置查权重只需 bisect + O(1) 索引
+        （见 _weighted_count_in_spans），把原先"每词 × 每位置 × 扫描所有
+        重叠 span"的 O(|pair_spans|·|positions|) 查询降到 O(log)。
+        """
+        if not pair_spans:
+            return []
+
+        # 同位置事件排序：kind=0(add) 排在 kind=1(remove) 前面，避免
+        # "一个 span 结束 & 另一个 span 紧接开始"的瞬时 gap。
+        events: list[tuple[int, int, float]] = []
+        for s, e, w in pair_spans:
+            events.append((s, 0, w))
+            events.append((e, 1, w))
+        events.sort()
+
+        heap: list[float] = []          # 存 -w 作为最大堆
+        removed: Counter = Counter()
+
+        result: list[tuple[int, int, float]] = []
+        prev_pos = events[0][0]
+        n = len(events)
+        i = 0
+        while i < n:
+            pos = events[i][0]
+            if pos > prev_pos:
+                # 取当前活动段最大权（先清理堆顶的懒删除项）
+                while heap:
+                    top = -heap[0]
+                    if removed.get(top, 0) > 0:
+                        removed[top] -= 1
+                        heappop(heap)
+                    else:
+                        break
+                cur_max = -heap[0] if heap else 0.0
+                if cur_max > 0:
+                    if (result and result[-1][1] == prev_pos
+                            and result[-1][2] == cur_max):
+                        s0, _, w0 = result[-1]
+                        result[-1] = (s0, pos, w0)
+                    else:
+                        result.append((prev_pos, pos, cur_max))
+            while i < n and events[i][0] == pos:
+                _, kind, w = events[i]
+                if kind == 0:
+                    heappush(heap, -w)
+                else:
+                    removed[w] += 1
+                i += 1
+            prev_pos = pos
+        return result
+
+    @staticmethod
+    def _prepare_pair_spans(pair_spans: list):
+        """扁平化 pair_spans，返回供 _weighted_count_in_spans 用的平行数组。
+
+        返回 (starts, ends, weights, total_weighted_len)：
+          starts/ends/weights — 三个等长 list，描述非重叠的 (s, e, max_w) 段
+          total_weighted_len  — Σ max_w·(e-s)，即"有效加权覆盖长度"
+                                （非重叠分段后这是精确值，不再是上界）
+        """
+        decomposed = TermExtractor._decompose_weighted_spans(pair_spans)
+        if not decomposed:
+            return [], [], [], 0.0
+        starts = [s for s, _, _ in decomposed]
+        ends = [e for _, e, _ in decomposed]
+        weights = [w for _, _, w in decomposed]
+        total_wlen = 0.0
+        for s, e, w in decomposed:
+            total_wlen += w * (e - s)
+        return starts, ends, weights, total_wlen
+
+    @staticmethod
+    def _weighted_count_in_spans(word: str, positions: list[int],
+                                 starts: list[int], ends: list[int],
+                                 weights: list[float]) -> float:
+        """word 所有出现位置在"扁平化 span 数组"里的加权命中之和。
+
+        扁平化后 span 互不重叠，每个位置最多落入一段，查询即一次
+        bisect + 端点检查。等价于原 _count_in_merged_spans 的复杂度，
+        但权重维度由扫描线步骤精确保留。
+        """
+        if not starts or not positions:
+            return 0.0
         wlen = len(word)
-        cnt = 0
+        total = 0.0
         for p in positions:
             i = bisect_right(starts, p) - 1
             if i >= 0 and p + wlen <= ends[i]:
-                cnt += 1
-        return cnt
+                total += weights[i]
+        return total
 
     # ------------------------------------------------------------------ #
     # 阶段三：多信号融合排序                                                  #
@@ -310,12 +439,37 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
         kw_templates = set(kw_info.get('templates') or set())
         aux_info = vocab.get(aux) or {} if dual else {}
 
-        # 双关键词联合证据：预算合并区间，循环里用作硬门槛与加分输入
-        merged_pair_spans: list[tuple[int, int]] = []
+        # 双关键词联合证据：扁平化 pair_spans、预算"有效加权覆盖"供显著性
+        # 门槛用；段落侧按段数比例算期望。
+        dec_starts: list[int] = []
+        dec_ends: list[int] = []
+        dec_weights: list[float] = []
+        win_cov_ratio = 0.0   # 加权窗口覆盖 / 全文长度，用作 null 期望系数
+        seg_cov_ratio = 0.0   # 联合段数 / 全部段数
         joint_segs: set[int] = set()
+        n_total_segs = getattr(self, '_n_segments', 0)
         if joint_meta:
-            merged_pair_spans = self._merge_spans(joint_meta['pair_spans'])
             joint_segs = joint_meta['joint_segs']
+            (dec_starts, dec_ends, dec_weights, total_weighted_len) = \
+                self._prepare_pair_spans(joint_meta['pair_spans'])
+            # 扁平化后 Σ w·L 即精确的"有效加权覆盖长度"（无重叠重复计数）
+            if self._text_len > 0:
+                win_cov_ratio = total_weighted_len / self._text_len
+            if n_total_segs > 0 and joint_segs:
+                seg_cov_ratio = len(joint_segs) / n_total_segs
+
+        # 循环前把属性/方法拉到局部，省掉 4000 次候选词的属性查找开销
+        word_segs_map = self._word_segs
+        find_all = self._find_all
+        weighted_count = self._weighted_count_in_spans
+        gate_mult = self.JOINT_GATE_MULT
+        gate_min_win = self.JOINT_GATE_MIN_WIN
+        gate_min_seg = self.JOINT_GATE_MIN_SEG
+        bonus_alpha = self.JOINT_BONUS_ALPHA
+        type_bonus = self.TYPE_MATCH_BONUS
+        tpl_bonus = self.TEMPLATE_FAMILY_BONUS
+        has_joint_win = bool(dec_starts)
+        has_joint_seg = bool(joint_segs)
 
         results = []
         for word in all_words:
@@ -325,19 +479,33 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
             if not self._passes_freq_gate(info, min_freq, max_freq):
                 continue
 
-            # ── 双关键词：联合证据硬门槛 ──
-            joint_window_hits = 0
+            # ── 双关键词：联合证据显著性门槛 ──
+            # 窗口侧用"加权命中"（距离衰减），段落侧用原始交集次数。
+            # 零假设：候选词均匀分布 → 期望命中 ≈ 候选频次 × 覆盖率。
+            # 通过条件：观测 >= max(floor, MULT × 期望)，二路 OR。
+            joint_weighted_win = 0.0
             joint_seg_hits = 0
             w_segs_total = 0
             if dual:
-                joint_window_hits = self._count_in_merged_spans(
-                    word, merged_pair_spans)
-                w_segs = self._word_segs.get(word, set())
-                w_segs_total = len(w_segs)
-                joint_seg_hits = (len(w_segs & joint_segs)
-                                  if w_segs_total else 0)
-                if (joint_window_hits < self.JOINT_GATE_MIN_HITS
-                        and joint_seg_hits < self.JOINT_GATE_MIN_HITS):
+                if has_joint_win:
+                    joint_weighted_win = weighted_count(
+                        word, find_all(word),
+                        dec_starts, dec_ends, dec_weights)
+                w_segs = word_segs_map.get(word)
+                if w_segs:
+                    w_segs_total = len(w_segs)
+                    if has_joint_seg:
+                        joint_seg_hits = len(w_segs & joint_segs)
+                w_freq = info['freq']
+                exp_win = w_freq * win_cov_ratio
+                exp_seg = w_segs_total * seg_cov_ratio
+                pass_win = (joint_weighted_win
+                            >= (gate_mult * exp_win if exp_win > gate_min_win
+                                else gate_min_win))
+                pass_seg = (joint_seg_hits
+                            >= (gate_mult * exp_seg if exp_seg > gate_min_seg
+                                else gate_min_seg))
+                if not (pass_win or pass_seg):
                     continue
 
             # 缺席策略直接给 0。原本的 MISS_PENALTY 是为了配合"命中越多
@@ -366,21 +534,27 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
                 w_type = info.get('type')
                 if (kw_type and w_type and w_type != 'misc'
                         and kw_type != 'misc' and w_type == kw_type):
-                    score += self.TYPE_MATCH_BONUS
+                    score += type_bonus
 
             # R6 模板同族
-            w_templates = set(info.get('templates') or set())
-            if kw_templates and (kw_templates & w_templates):
-                score += self.TEMPLATE_FAMILY_BONUS
+            w_templates = info.get('templates')
+            if kw_templates and w_templates and (kw_templates & w_templates):
+                score += tpl_bonus
 
             # ── 双关键词：联合证据加分（纯位置，无分类假设）──
+            # ratio_win 用加权命中 / 候选总频次，等价于"平均每次出现
+            # 有多少概率落在 A、B 紧邻的语境中"（紧邻 w≈1，远端 w≈0）。
             if dual:
-                w_freq = max(info['freq'], 1)
-                ratio_win = joint_window_hits / w_freq
+                w_freq_norm = w_freq if w_freq > 0 else 1
+                ratio_win = joint_weighted_win / w_freq_norm
+                if ratio_win > 1.0:
+                    ratio_win = 1.0
                 ratio_seg = (joint_seg_hits / w_segs_total
                              if w_segs_total else 0.0)
-                joint_ratio = min(max(ratio_win, ratio_seg), 1.0)
-                score *= 1.0 + self.JOINT_BONUS_ALPHA * joint_ratio
+                joint_ratio = ratio_win if ratio_win > ratio_seg else ratio_seg
+                if joint_ratio > 1.0:
+                    joint_ratio = 1.0
+                score *= 1.0 + bonus_alpha * joint_ratio
 
             labels = []
             if s_char > 0:
@@ -507,12 +681,14 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
           morpheme / substitution / co_topic
 
         aux_keyword 非空 → 双关键词联合模式：
-          • char/morph：A 与 B 各跑一次后逐词取 max（任一边即可贡献信号）
+          • char/morph：A 与 B 各跑一次后用几何平均融合，单边贡献的
+            A/B 亲族词得分被大幅压制，偏向"双边都像"的候选
           • context/cooccur：seeds=[A,B] 但仅在联合锚点位置抽取/统计
           • co_topic：seed_segs 改用 word_segs[A] ∩ word_segs[B]
           • substitution：保持原行为（seeds=[A,B] 全位置），由用户后续调权
-        joint_meta：单关键词时为 None；双关键词时含 pair_spans / joint_segs，
-                    供 extract 做硬门槛与加分。
+        joint_meta：单关键词时为 None；双关键词时含 pair_spans（已带距离
+                    衰减权重 (s, e, w)）/ joint_segs，供 extract 做显著性
+                    门槛与加权加分。
         """
         raw_char = self._strategy_char_overlap(keyword, vocab).scores
         raw_morph = self._strategy_morpheme(keyword, vocab).scores
@@ -520,12 +696,15 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
         joint_meta = None
 
         if aux_keyword:
-            # ── 字面、构词通道：A、B 各跑一次取 max ──
-            raw_char = self._max_fuse(
+            # ── 字面、构词通道：A、B 各跑一次后"几何平均"融合 ──
+            # 原 _max_fuse(a,b) = max 会把"只像 A 不像 B"的 A 亲族词拉满
+            # 分；_geom_fuse 让双边同时带信号的词占优，仅单边贡献的被
+            # ε 平滑压到 ~0.13 量级。
+            raw_char = self._geom_fuse(
                 raw_char,
                 self._strategy_char_overlap(aux_keyword, vocab).scores,
             )
-            raw_morph = self._max_fuse(
+            raw_morph = self._geom_fuse(
                 raw_morph,
                 self._strategy_morpheme(aux_keyword, vocab).scores,
             )
