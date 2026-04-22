@@ -24,3 +24,6 @@ Thumbs.db
 
 # 日志文件
 *.log
+
+# 测试数据
+benchmark_output/
