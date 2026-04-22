@@ -498,15 +498,22 @@ class StrategiesMixin:
         n_frames = len(seed_frames)
 
         # ── 2. 对每个框架，搜索可替换词 ──
+        # 按 left 分桶：同一 left 的多个 right 共用一次 _find_all + 一次
+        # _vocab_after。_FRAME_SPECS 中 rw ∈ {1, 2}，桶内再按 rlen 拆成两个
+        # dict，每个位置只切两次 text 即可 O(1) 命中。
+        # 边界安全：text 切片越界会返回短串，长度不等的 key 天然落不进桶。
+        frames_by_left: dict[str, tuple[dict[str, None], dict[str, None]]] = {}
+        for left, right in seed_frames:
+            bucket = frames_by_left.get(left)
+            if bucket is None:
+                bucket = ({}, {})
+                frames_by_left[left] = bucket
+            bucket[len(right) - 1][right] = None
+
         word_frames: dict[str, set[tuple[str, str]]] = {}
-        word_weight: dict[str, float] = {}
 
-        sorted_frames = sorted(seed_frames.items(),
-                               key=lambda x: x[1], reverse=True)
-
-        for (left, right), frame_w in sorted_frames:
+        for left, (rights1, rights2) in frames_by_left.items():
             llen = len(left)
-            rlen = len(right)
             positions = self._find_all(left)
             if len(positions) > _max_scan:
                 step = len(positions) // _max_scan + 1
@@ -518,10 +525,16 @@ class StrategiesMixin:
                     if w in seed_set:
                         continue
                     w_end = ws + len(w)
-                    if (w_end + rlen <= text_len
-                            and text[w_end:w_end + rlen] == right):
-                        word_frames.setdefault(w, set()).add((left, right))
-                        word_weight[w] = word_weight.get(w, 0) + frame_w
+                    if rights1:
+                        slc1 = text[w_end:w_end + 1]
+                        if slc1 in rights1:
+                            word_frames.setdefault(w, set()).add(
+                                (left, slc1))
+                    if rights2:
+                        slc2 = text[w_end:w_end + 2]
+                        if slc2 in rights2:
+                            word_frames.setdefault(w, set()).add(
+                                (left, slc2))
 
         # ── 3. 计算得分 ──
         # 除以 log_freq_p2[w]：候选词越高频，惩罚越大，抵消 "高频词靠运气
