@@ -292,6 +292,7 @@ class VocabBuilderMixin:
         self._vocab = vocab
         self._vocab_relaxed = vocab_relaxed
         self._find_cache: dict[str, list[int]] = {}
+        self._positions: dict[str, list[int]] = {}
 
         # ── 通道 B：模板狙击，产出 L2 候选池 ──
         miner = PatternMiner(min_len=self.min_len, max_len=self.max_len)
@@ -400,15 +401,18 @@ class VocabBuilderMixin:
         vocab_starts: DefaultDict[int, list] = defaultdict(list)
         vocab_ends: DefaultDict[int, list] = defaultdict(list)
         word_segs: DefaultDict[str, set] = defaultdict(set)
+        positions: DefaultDict[str, list] = defaultdict(list)
 
         if not cands:
             self._vocab_starts = {}
             self._vocab_ends = {}
             self._word_segs = {}
+            self._positions = {}
             return
 
         # 自动机里只塞需要的最小集合（candidates 的并集），匹配命中即可
-        # 同时分流到三张索引。
+        # 同时分流到四张索引。positions 是在这次扫描里顺手吐出来的副产品，
+        # 供 _find_all 在 extract 阶段直接查表，避免每个候选重跑 str.find。
         automaton = ahocorasick.Automaton()
         for w in cands:
             automaton.add_word(w, w)
@@ -417,6 +421,7 @@ class VocabBuilderMixin:
         # iter 给的是 (end_idx, value)，end_idx 是命中末字的 inclusive 下标
         for end_idx, word in automaton.iter(text):
             start = end_idx - len(word) + 1
+            positions[word].append(start)
             word_segs[word].add(start // seg_size)
             if word in clean_set:
                 vocab_starts[start].append(word)
@@ -425,6 +430,7 @@ class VocabBuilderMixin:
         self._vocab_starts = dict(vocab_starts)
         self._vocab_ends = dict(vocab_ends)
         self._word_segs = dict(word_segs)
+        self._positions = dict(positions)
 
     def _ensure_strategy_caches(self, vocab: dict):
         """extract() 在合并 channel-C extras 后调用，把新增词补进缓存。
@@ -445,6 +451,7 @@ class VocabBuilderMixin:
         text = self._text
         vocab_starts = self._vocab_starts
         vocab_ends = self._vocab_ends
+        positions = self._positions
 
         for w, info in vocab.items():
             if w in log1:
@@ -457,13 +464,16 @@ class VocabBuilderMixin:
             clean_set.add(w)
             wlen = len(w)
             start = 0
+            pos_list: list[int] = []
             while True:
                 p = text.find(w, start)
                 if p < 0:
                     break
+                pos_list.append(p)
                 vocab_starts.setdefault(p, []).append(w)
                 vocab_ends.setdefault(p + wlen, []).append(w)
                 start = p + 1
+            positions[w] = pos_list
 
     # ------------------------------------------------------------------ #
     # 候选池合并：L1 (统计通道) + L2 (模板通道)                                #
@@ -552,17 +562,29 @@ class VocabBuilderMixin:
 
         log-PMI = log(N · freq(word) / (freq(L) · freq(R)))
         对词长天然归一化（随机基线 ≈ 0），无需长度折扣。
+
+        热点函数：profile 显示被调用 100 万+ 次、dict.get 4000 万+ 次。
+        局部变量绑定消除每轮循环里的属性查找（self._freq → freq_get、
+        math.log → log），并将 min() 内联为分支判断，纯 CPython 层面优化，
+        数值结果完全等价。
         """
-        f = self._freq.get(word, 0)
-        if f == 0 or len(word) < 2:
+        freq_get = self._freq.get
+        f = freq_get(word, 0)
+        wlen = len(word)
+        if f == 0 or wlen < 2:
             return 0.0
         total = self._total_chars
+        log = math.log
         worst = float('inf')
-        for i in range(1, len(word)):
-            lf = self._freq.get(word[:i], 1)
-            rf = self._freq.get(word[i:], 1)
-            pmi = math.log(total * f / max(lf * rf, 1))
-            worst = min(worst, pmi)
+        for i in range(1, wlen):
+            lf = freq_get(word[:i], 1)
+            rf = freq_get(word[i:], 1)
+            lr = lf * rf
+            if lr < 1:
+                lr = 1
+            pmi = log(total * f / lr)
+            if pmi < worst:
+                worst = pmi
         return worst
 
     def _filter_extensions(self, vocab: dict, freq: Counter,
@@ -627,7 +649,15 @@ class VocabBuilderMixin:
     # ------------------------------------------------------------------ #
 
     def _find_all(self, s: str) -> list[int]:
-        """返回子串 s 在全文中所有出现的起始位置（带缓存）"""
+        """返回子串 s 在全文中所有出现的起始位置（带缓存）。
+
+        build_index 已用 Aho-Corasick 扫一遍全文，把所有候选词的位置固化到
+        self._positions 里（_ensure_strategy_caches 对 channel-C extras 也做
+        了增量）。命中表查询是 O(1)；只有关键词本身或词表外字符串才退化到
+        text.find，结果再进 _find_cache。"""
+        pos = self._positions.get(s)
+        if pos is not None:
+            return pos
         cached = self._find_cache.get(s)
         if cached is not None:
             return cached

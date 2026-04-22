@@ -14,6 +14,8 @@ from bisect import bisect_right
 from collections import Counter, defaultdict
 from heapq import heappop, heappush
 
+import ahocorasick
+
 from ._utils import _normalize, _LEFT_NOISE, _RIGHT_NOISE
 from ._vocab_builder import VocabBuilderMixin
 from ._strategies import StrategiesMixin
@@ -788,6 +790,11 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
           1. 短词独立性低（< 15%）→ 短词是长词的残片 → 合并到长词下
           2. 短词独立性高 + 长词频次远低于短词（< 5%）→ 长词是临时短语 → 挂到短词下
           3. 短词独立性高 + 长词频次也不低 → 两个独立术语，不合并
+
+        原实现是 O(n²) 的两两子串扫描（`wi in wj`），n=3000 时单次提取就是
+        14s 的热点。这里先用 Aho-Corasick 把包含关系一次性挖出来
+        （复杂度 O(Σ|wj|)），再按原 (i<j) 次序遍历包含对，首次写入
+        child_of 胜出的语义与原代码完全一致。
         """
         noise = _LEFT_NOISE | _RIGHT_NOISE
         raw_freq = self._freq
@@ -796,19 +803,45 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
         n = len(words)
         child_of: dict[int, int] = {}
 
-        for i in range(n):
-            for j in range(i + 1, n):
-                wi, wj = words[i], words[j]
-                if len(wi) == len(wj):
-                    continue
+        # related[i] = 存在包含关系（任一方向）且下标 > i 的 j 列表。
+        # 等长词对与原实现一致地不进入（原 `if len == len: continue`）。
+        related: list[list[int]] = [[] for _ in range(n)]
+        if n >= 2:
+            auto = ahocorasick.Automaton()
+            for idx, w in enumerate(words):
+                # 同一词串在 results 里若重复出现（理论上不应该），
+                # 只留最后一次的 idx 也没关系：同串互相包含在原算法里
+                # 也会因等长被 continue 跳过。
+                auto.add_word(w, (idx, len(w)))
+            auto.make_automaton()
 
-                if len(wi) < len(wj):
-                    if wi not in wj:
+            for j in range(n):
+                wj = words[j]
+                jlen = len(wj)
+                seen: set[int] = set()
+                for _end, (hit_idx, hit_len) in auto.iter(wj):
+                    # 过滤掉自己与等长命中（后者对应原代码 len 相等 continue）
+                    if hit_idx == j or hit_len >= jlen:
                         continue
+                    seen.add(hit_idx)
+                for i in seen:
+                    if i < j:
+                        related[i].append(j)
+                    else:
+                        related[j].append(i)
+
+        for i in range(n):
+            rel = related[i]
+            if not rel:
+                continue
+            rel.sort()  # 保证内层按 j 升序遍历，与原 (i<j) 双层循环一致
+            wi = words[i]
+            len_i = len(wi)
+            for j in rel:
+                wj = words[j]
+                if len_i < len(wj):
                     short_idx, long_idx = i, j
                 else:
-                    if wj not in wi:
-                        continue
                     short_idx, long_idx = j, i
 
                 short_w = words[short_idx]
