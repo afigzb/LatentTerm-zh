@@ -48,6 +48,7 @@ from ._utils import (
     _RE_CHINESE, _entropy, _clean_boundary,
     _LONG_PHRASE_INTERIOR, _DIALOGUE_TRAIL,
 )
+from .filters.linguistic import L1_LING_PIPELINE
 from ._pattern_miner import PatternMiner, can_decompose_by_l1
 
 
@@ -199,9 +200,20 @@ class VocabBuilderMixin:
 
         del segments  # ~text 大小的副本，及时释放
 
-        # 第二轮：自由度 + 名字+对白动词 终筛
+        # 第二轮：语言学过滤 + 自由度 + 名字+对白动词 终筛
         # 按长度顺序处理，保证 prefix in solid 检查时短词已先入 solid
+        ling_pipeline = L1_LING_PIPELINE
+        ling_min_len = self.min_len
+        ling_max_len = self.max_len
         for w, wlen in pmi_passed:
+            # 语言学过滤器（与 L2 共用同一套规则，见 core.filters.linguistic）。
+            # L1_LING_PIPELINE 包含：length / boundary / blacklist / structural /
+            # adverbial_di，但**不含** dialogue_tail——L1 侧的对白动词判定是
+            # context-aware 的（要求 prefix 也在 solid 中才拒绝），见下方。
+            if not ling_pipeline.is_valid(
+                    w, min_len=ling_min_len, max_len=ling_max_len):
+                continue
+
             # 自由度预过滤：如果两侧都有邻字观测，则要求两侧都有起码的多样性
             left_cnt = sum(raw_left[w].values())
             right_cnt = sum(raw_right[w].values())
@@ -211,7 +223,7 @@ class VocabBuilderMixin:
                 if raw_freedom < solid_free:
                     continue
 
-            # 名字+对白动词不应作为分词单元
+            # 名字+对白动词不应作为分词单元（context-aware）
             if wlen >= 3 and w[-1] in _DIALOGUE_TRAIL:
                 prefix = w[:-1]
                 if len(prefix) >= self.min_len and prefix in solid:

@@ -23,7 +23,7 @@
 import re
 from collections import Counter, defaultdict
 
-from ._utils import _LEFT_NOISE, _RIGHT_NOISE, _PHRASE_MARKERS, _DIALOGUE_TRAIL
+from .filters.linguistic import DEFAULT_LING_PIPELINE, trim_noise
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -168,155 +168,8 @@ def infer_keyword_type(keyword: str) -> str | None:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 候选校验
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-# 伪名黑名单（模板常会碰到的高频代词/连词/虚化名词）
-_BLACK_WORDS = frozenset({
-    # 指示代词 / 连词
-    '这个', '那个', '其中', '于是', '所以', '然后', '因此', '但是',
-    '不过', '这时', '那时', '此时', '此刻', '此后', '随后', '众人',
-    '大家', '我们', '他们', '她们', '它们', '你们', '自己', '别人',
-    '一些', '一点', '一切', '一边', '一旁', '什么', '怎么', '如何',
-    '那里', '这里', '哪里', '何处', '何方', '事情', '东西', '地方',
-    '时候', '之后', '之前', '以后', '以前', '结果', '办法',
-    # 类属抽象词（不是专名，是范畴词）
-    '强者', '佣兵', '种族', '势力', '核心', '目光', '记名', '习会',
-    '二人', '三人', '四人', '五人', '众多', '众位', '各位', '诸位',
-    '此人', '此物', '吾儿', '修者', '长辈', '晚辈', '同门', '同辈',
-    '前辈', '后辈', '门人', '弟子', '族人', '家人', '友人', '故人',
-    '之人', '之物', '之流', '之辈', '之内', '之外', '之上', '之下',
-    '美其名', '做记名', '天材地宝', '真空地带',
-    # "另/其/数量 + 单位" 类泛化引用
-    '另一', '另外', '一名', '两名', '三名', '一位', '两位', '三位',
-    '一个', '两个', '三个', '一只', '两只', '三只',
-})
-
-
-def _trim_noise(w: str) -> str:
-    """去两端噪字，并切掉中间助词。返回"最长合法子串"。"""
-    if not w:
-        return ''
-    # 两端 trim
-    lo, hi = 0, len(w)
-    while lo < hi and w[lo] in _LEFT_NOISE:
-        lo += 1
-    while hi > lo and w[hi - 1] in _RIGHT_NOISE:
-        hi -= 1
-    if lo >= hi:
-        return ''
-    # 中间助词：如果有"的/和/与/是"，按最后一个助词后切
-    trimmed = w[lo:hi]
-    cut = -1
-    for i, c in enumerate(trimmed):
-        if c in _PHRASE_MARKERS:
-            cut = i
-    if cut >= 0:
-        trimmed = trimmed[cut + 1:]
-    return trimmed
-
-
-# 数字字（"一二三..."）。**只**在后接量词单位字时用于拦截，
-# 避免误伤"九阳神功""五岳剑派""三国演义""八荒六合"等武侠命名。
-_NUM_PREFIX_CHARS = frozenset(
-    '一二三四五六七八九十百千万两几众多每某另'
-)
-# 量词单位字（"名位个只头尊" + X，X 才是专名）。
-# 注意：**不含"张"**——"张"作为姓氏极常见（张无忌、张三丰），
-# "三张纸"这种误用可以靠 L1 分解（桌子/纸 在 L1）后期再拦。
-_QUANTIFIER_UNITS = frozenset(
-    '名位个只头尊条匹根片块场阵把段丝缕支杯盘串团朵人'
-)
-
-# 2 字前缀黑名单（常见副词/修饰短语起始）
-_BAD_PREFIXES = frozenset({
-    '另外', '其他', '其中', '此外', '另一', '一个', '一种', '一名',
-    '一位', '几位', '几名', '几个', '哪位', '谁家', '那位', '这位',
-    '每位', '众位', '各位',
-    '做记', '美其', '清楚', '忍不', '冲着', '虽然', '见到', '最后',
-    '三名', '两名', '两位', '三位', '四名', '四位', '五名', '五位',
-    '他清', '她清', '我清',      # "他清楚地知..."
-    '这名', '那名', '每名', '众名',
-})
-
-
-# Jieba 词性分析（懒加载），用于识别"副词+地+动词"结构
-_jieba_pseg = None
-
-
-def _get_pseg():
-    """懒加载 jieba.posseg，避免每次 import 触发 jieba 初始化。"""
-    global _jieba_pseg
-    if _jieba_pseg is None:
-        import jieba
-        import jieba.posseg as pseg
-        jieba.setLogLevel(60)   # 静音 jieba 初始化日志
-        _jieba_pseg = pseg
-    return _jieba_pseg
-
-
-def _is_adverbial_di_phrase(w: str) -> bool:
-    """Jieba 视角下判断 w 是否是"副词/形容词 + 地 + 动词"结构。
-
-    三条独立规则，任一命中即判为副词短语（拒绝）：
-      R1. 存在 token 为 '地'，词性标为 uv/u/ud/ug（结构助词）
-          → 明确的副词标记（无奈地开口、惊骇地失声）
-      R2. 首 token 词性以 z/d/ad 开头（叠字状态词/副词/副形）
-          → 专名极少以这种词性起始（淡淡地开口 → 首 z）
-      R3. 存在非单字 token 以"地"开头（如 '地知'、'地轻'）
-          → jieba 把 "...地 + X" 误粘成一个词（清楚地知 → 地知/n）
-
-    对 '九幽地冥蟒' 三条都不命中 → 放行（首 m"九"、无 uv、
-    "幽地"开头是"幽"）。
-    """
-    if '地' not in w:
-        return False
-    tokens = list(_get_pseg().cut(w))
-    if not tokens:
-        return False
-    # R1: 结构助词"地"
-    for tk in tokens:
-        if tk.word == '地' and tk.flag in ('uv', 'u', 'ud', 'ug'):
-            return True
-    # R2: 首 token 是状态/副词性
-    first_flag = tokens[0].flag or ''
-    if first_flag[:1] in ('z', 'd'):
-        return True
-    if first_flag[:2] == 'ad':
-        return True
-    # R3: 非单字 token 以"地"起始（jieba 乱粘信号）
-    for tk in tokens:
-        if len(tk.word) >= 2 and tk.word[0] == '地':
-            return True
-    return False
-
-
-def _valid_candidate(w: str, min_len: int = 2, max_len: int = 8) -> bool:
-    if not (min_len <= len(w) <= max_len):
-        return False
-    if w in _BLACK_WORDS:
-        return False
-    if w[0] in _LEFT_NOISE or w[-1] in _RIGHT_NOISE:
-        return False
-    # 最后一个字是对白动词首字，大概率把"道/说"粘进来了
-    if w[-1] in _DIALOGUE_TRAIL:
-        return False
-    # 首字是量词单位 → 拒绝（"名斗宗""位前辈"首字是单位字）
-    if w[0] in _QUANTIFIER_UNITS:
-        return False
-    # 首字数字 + 第二字量词单位 → 拒绝（"三名XX""一头XX""两只XX"）
-    # 但"九阳""五岳""三国""七窍"这类放行（第二字是名词不是量词）
-    if len(w) >= 2 and w[0] in _NUM_PREFIX_CHARS and w[1] in _QUANTIFIER_UNITS:
-        return False
-    # 2 字前缀黑名单（适用于 3+ 字候选）
-    if len(w) >= 3 and w[:2] in _BAD_PREFIXES:
-        return False
-    # 中间含强助词 → 拒绝
-    for i in range(1, len(w) - 1):
-        if w[i] in _PHRASE_MARKERS:
-            return False
-    # 含"地"时做 Jieba 词性判定（替换掉原本的"中间含地即拒"硬规则）
-    if '地' in w[1:] and _is_adverbial_di_phrase(w):
-        return False
-    return True
+# 语言学规则（黑名单 / 量词结构 / 副词+地 / 边界噪字 …）已统一迁往
+# core.filters.linguistic，本文件只调用 DEFAULT_LING_PIPELINE 和 trim_noise。
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -386,8 +239,9 @@ class PatternMiner:
             origin = pid.split('.')[0]
             for m in rx.finditer(text):
                 raw = m.group(gi)
-                w = _trim_noise(raw)
-                if not _valid_candidate(w, self.min_len, self.max_len):
+                w = trim_noise(raw)
+                if not DEFAULT_LING_PIPELINE.is_valid(
+                        w, min_len=self.min_len, max_len=self.max_len):
                     continue
                 pos = m.start(gi)
 
@@ -466,7 +320,7 @@ class PatternMiner:
         known_vocab = known_vocab or set()
 
         def _add(w: str, pos: int, tmpl: str):
-            w = _trim_noise(w)
+            w = trim_noise(w)
             if not w:
                 return
             # 候选池对齐：如果捕获串较长，优先从中取 known_vocab 内的最长子串，
@@ -475,7 +329,8 @@ class PatternMiner:
                 aligned = _align_to_vocab(w, known_vocab)
                 if aligned:
                     w = aligned
-            if not _valid_candidate(w, self.min_len, self.max_len):
+            if not DEFAULT_LING_PIPELINE.is_valid(
+                    w, min_len=self.min_len, max_len=self.max_len):
                 return
             if w == keyword:
                 return
