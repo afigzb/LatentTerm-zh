@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from core.text_cleaner import clean_text
 from core.term_extractor import TermExtractor, DEFAULT_CONFIG
 from core.dict_filter import DictFilter
+from core.filters.linguistic import DEFAULT_LING_PIPELINE, L1_LING_PIPELINE
 
 
 _TYPE_ZH = {
@@ -209,6 +210,40 @@ def dump_children_csv(results: list[dict], path: Path):
     return len(rows)
 
 
+def dump_filter_stats_csv(path: Path):
+    """汇总 L1 和 L2 管道的拒绝统计并写出 CSV。"""
+    merged_stats: dict[str, dict[str, int]] = {}
+    
+    for pipeline, prefix in [(L1_LING_PIPELINE, 'L1'), (DEFAULT_LING_PIPELINE, 'L2')]:
+        for reason, word_counts in pipeline.stats.items():
+            full_reason = f"{prefix}_{reason}"
+            if full_reason not in merged_stats:
+                merged_stats[full_reason] = {}
+            for w, c in word_counts.items():
+                merged_stats[full_reason][w] = merged_stats[full_reason].get(w, 0) + c
+
+    rows = []
+    for reason, word_counts in merged_stats.items():
+        # 对每个 reason，按频次降序取前 100 个词作为 sample 展示
+        sorted_words = sorted(word_counts.items(), key=lambda x: -x[1])
+        total_count = sum(c for w, c in sorted_words)
+        unique_count = len(sorted_words)
+        
+        # 拼装 sample 字符串，例如 "我们(150) | 这个(120) | ..."
+        samples = " | ".join(f"{w}({c})" for w, c in sorted_words[:100])
+        
+        rows.append({
+            '拒绝原因': reason,
+            '总拦截频次': total_count,
+            '独立词数': unique_count,
+            '拦截样本(Top100)': samples
+        })
+        
+    rows.sort(key=lambda r: -r['总拦截频次'])
+    write_csv(path, rows, ['拒绝原因', '总拦截频次', '独立词数', '拦截样本(Top100)'])
+    return len(rows)
+
+
 # ──────────────────────────────────────────────────────────────
 # 主流程
 # ──────────────────────────────────────────────────────────────
@@ -280,6 +315,10 @@ def main():
     print(f"  原始字符数: {stats.get('original_length'):,}")
     print(f"  清洗后字符: {stats.get('final_length'):,}")
     print(f"  清除脏字符: {stats.get('dirty_chars_removed')}")
+
+    # 开启过滤统计
+    DEFAULT_LING_PIPELINE.enable_stats = True
+    L1_LING_PIPELINE.enable_stats = True
 
     # ── Stage 3：build_index（分词核心算法）────────────────────
     print("\n[Stage 3] 构建词表索引 (build_index) —— 分词核心算法")
@@ -364,6 +403,9 @@ def main():
     n_cand_rows = dump_candidates_csv(extractor, out_dir / '分词结果_全量候选池.csv')
     print(f"  分词结果_全量候选池.csv      —— {n_cand_rows:,} 行")
 
+    n_filter_stats = dump_filter_stats_csv(out_dir / '过滤统计_filter_stats.csv')
+    print(f"  过滤统计_filter_stats.csv    —— {n_filter_stats:,} 行")
+
     n_s_rows = dump_extract_csv(results_single, out_dir / f'提取_{args.keyword_single}.csv')
     n_s_child = dump_children_csv(results_single, out_dir / f'提取_{args.keyword_single}_子术语展开.csv')
     print(f"  提取_{args.keyword_single}.csv                —— {n_s_rows:,} 行主词")
@@ -442,6 +484,7 @@ def main():
     lines.append("  ─ 结果文件（分析用）")
     lines.append("    分词结果_L1词表.csv               —— L1 严格词表（双通过）")
     lines.append("    分词结果_全量候选池.csv           —— L1 + 模板挖矿 L2 全部候选")
+    lines.append("    过滤统计_filter_stats.csv         —— 语言学过滤器拦截原因与高频词采样")
     lines.append(f"    提取_{args.keyword_single}.csv                —— 单关键词提取主词表")
     lines.append(f"    提取_{args.keyword_single}_子术语展开.csv     —— 主词对应子术语展开")
     lines.append(f"    提取_{dual_name}.csv         —— 双关键词联合提取主词表")
