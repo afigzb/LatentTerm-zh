@@ -211,7 +211,7 @@ Write-Host "总大小：  $sizeMB MB"
 # ── 10. 可选压缩 ─────────────────────────────────────
 if ($Zip) {
     Write-Step '压缩为 zip'
-    $ZipFile = Join-Path $DistRoot "$AppName-便携版-$(Get-Date -Format 'yyyyMMdd').zip"
+    $ZipFile = Join-Path $DistRoot "$AppName$(Get-Date -Format 'yyyyMMdd').zip"
     if (Test-Path $ZipFile) { Remove-Item $ZipFile -Force }
     Compress-Archive -Path $BuildDir -DestinationPath $ZipFile -CompressionLevel Optimal
     $zipMB = [math]::Round((Get-Item $ZipFile).Length / 1MB, 1)
