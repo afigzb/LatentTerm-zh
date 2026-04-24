@@ -194,7 +194,7 @@ LatentTerm-zh · 中文小说术语挖掘
   启动.bat    启动入口
 
 【项目地址】
-  https://github.com/（此处填你的仓库地址）
+  https://github.com/afigzb/LatentTerm-zh/releases/tag/v1.0.0
 
 构建日期：$(Get-Date -Format 'yyyy-MM-dd')
 Python 版本：$PythonVersion
