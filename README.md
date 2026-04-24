@@ -69,6 +69,47 @@ core/
 
 `streamlit`、`pandas`、`jieba`、`pyahocorasick`、`charset-normalizer`、`matplotlib`，全部见 `requirements.txt`。Python 3.10+。
 
+## 打包成便携版（面向非技术用户）
+
+项目内置了一键打包脚本，产出"解压即用"的 Windows 便携版，目标用户双击 `启动.bat` 就能在浏览器里使用，无需安装 Python 或任何依赖。
+
+```powershell
+# 在仓库根目录执行
+powershell -ExecutionPolicy Bypass -File scripts\build_portable.ps1
+
+# 同时压缩为 zip（方便上传 Release / 网盘）
+powershell -ExecutionPolicy Bypass -File scripts\build_portable.ps1 -Zip
+```
+
+脚本做的事：
+
+1. 从 python.org 下载 `python-3.11.9-embed-amd64.zip`（首次约 10 MB，之后走缓存）
+2. 用 `get-pip.py` 引导 pip，再把 `requirements.txt` 装到独立的 `libs\` 目录
+3. 拷贝 `core/`、`app.py`、`.streamlit/`、`README.md`、`LICENSE` 到产物目录
+4. 生成 `启动.bat` 和 `使用说明.txt`
+
+产物结构（`dist\LatentTerm\`，约 300–500 MB）：
+
+```text
+LatentTerm\
+├─ python\          嵌入版 Python 3.11.9
+├─ libs\            streamlit / jieba / pandas / ...
+├─ core\            核心算法
+├─ app.py
+├─ .streamlit\
+├─ 启动.bat          用户双击入口
+└─ 使用说明.txt
+```
+
+最终用户无需装任何东西，下载 zip → 解压 → 双击「启动.bat」→ 浏览器自动弹出页面即可使用。
+
+### 常见问题
+
+- **Windows Defender / SmartScreen 拦截**：因为 `.bat` + 独立 Python 被误判。点「更多信息 → 仍要运行」即可。程序完全离线、不联网。
+- **端口 8965 被占用**：关掉占用的程序，或修改 `.streamlit\config.toml` 里的 `port`。
+- **国内网络下载 pip 包慢**：编辑 `scripts\build_portable.ps1`，在 `pip install` 那行加上 `-i https://pypi.tuna.tsinghua.edu.cn/simple`。
+
+
 ## 许可
 
 MIT，见 `LICENSE`。
