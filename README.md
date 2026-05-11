@@ -69,7 +69,7 @@ core/
 
 `streamlit`、`pandas`、`jieba`、`pyahocorasick`、`charset-normalizer`、`matplotlib`，全部见 `requirements.txt`。Python 3.10+。
 
-## 打包成便携版（面向非技术用户）
+## 打包成便携版
 
 项目内置了一键打包脚本，产出"解压即用"的 Windows 便携版，目标用户双击 `启动.bat` 就能在浏览器里使用，无需安装 Python 或任何依赖。
 
