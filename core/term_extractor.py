@@ -28,7 +28,7 @@ from ._pattern_miner import (
 DEFAULT_CONFIG = {
     'min_freq': 5,
     'max_freq': 0,
-    'top_n': 4000,
+    'top_n': 1000,
     'w_char': 0.1, 'w_context': 0.50, 'w_cooccur': 0.35,
     'w_morph': 0.1, 'w_subst': 0.3, 'w_topic': 0.25,
 }
@@ -38,21 +38,24 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
 
     # ── 集中管理的阈值与参数 ──────────────────────────────────────────────
 
+    # 临时关闭 L2 模板通道；恢复时改回 True 即可。
+    ENABLE_L2 = False
+
     # Pass 1 双重过滤（build_index 两步法使用）
-    SOLID_PMI_MIN = 1.0
+    SOLID_PMI_MIN = 1.5
     SOLID_FREE_MIN = 0.1
 
     # 词表构建（build_index 使用），log-PMI 尺度
-    VOCAB_COH_STRICT = 3.0
-    VOCAB_FREE_STRICT = 0.1
-    VOCAB_COH_RELAXED = 1.5
-    VOCAB_FREE_RELAXED = 0.03
+    VOCAB_COH_STRICT = 3.5
+    VOCAB_FREE_STRICT = 0.15
+    VOCAB_COH_RELAXED = 2.3
+    VOCAB_FREE_RELAXED = 0.08
 
     # 伪合成词过滤（_filter_extensions 使用），log-PMI 尺度
     FILTER_COH_STRICT = 3.0
-    FILTER_COH_LENIENT = 2.0
+    FILTER_COH_LENIENT = 2.5
     FILTER_DOM_STRICT = 8
-    FILTER_DOM_LENIENT = 20
+    FILTER_DOM_LENIENT = 12
 
     # 类型先验 & 模板同族（R5 / R6）
     # 类型先验改为加法式"弱证据"：同类加分，异类不处理。
@@ -102,6 +105,8 @@ class TermExtractor(VocabBuilderMixin, StrategiesMixin):
         positions_override: 双关键词模式下传入"靠近另一关键词的子集位置"，
             让模板挖矿只看 AB 共现处，避免引入只跟单边强相关的临时词。
         """
+        if not self.ENABLE_L2:
+            return {}
         if positions_override is not None:
             positions = positions_override
         else:

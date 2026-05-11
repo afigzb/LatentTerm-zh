@@ -308,7 +308,7 @@ class VocabBuilderMixin:
 
         # ── 通道 B：模板狙击，产出 L2 候选池 ──
         miner = PatternMiner(min_len=self.min_len, max_len=self.max_len)
-        pattern_hits = miner.mine(text)
+        pattern_hits = miner.mine(text) if self.ENABLE_L2 else {}
 
         # ── 合并 L1 (vocab_relaxed) + L2 (pattern_hits) → candidates ──
         self._candidates = self._merge_candidates(
