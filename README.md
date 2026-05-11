@@ -6,6 +6,8 @@
 
 举个例子，喂一本《斗罗大陆》、关键词填「魂兽」，会得到「柔骨兔」「人面魔蛛」「泰坦巨猿」之类——它们和「魂兽」**字面上没有重合**，但在原文语境里属于同一类东西。
 
+在线演示：[https://mwhtfy7awcodnv4ye6rrym.streamlit.app/](https://mwhtfy7awcodnv4ye6rrym.streamlit.app/)
+
 ## 它能做什么
 
 - **术语聚合**：给一个种子词，找出原文里和它同类/相关的词。
